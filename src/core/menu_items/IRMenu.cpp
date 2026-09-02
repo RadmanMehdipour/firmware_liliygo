@@ -1,35 +1,97 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  IRMenu.cpp — organized into Attacks / Sniffers folders
+//
+//  Changes vs your updated version:
+//   • "IR Cycle" option kept (calls startIrCycle())
+//   • Reorganized into Attacks / Sniffers, same style as WiFi/BLE/RF/NRF24
+// ═══════════════════════════════════════════════════════════════════════════
+
 #include "IRMenu.h"
 #include "core/display.h"
 #include "core/settings.h"
 #include "core/utils.h"
-#include "modules/ir/TV-B-Gone.h"
-#include "modules/ir/custom_ir.h"
-#include "modules/ir/ir_jammer.h"
+#include "modules/ir/ir_cycle.h"   // ← your IR Cycle addition
 #include "modules/ir/ir_read.h"
+#include "modules/ir/ir_jammer.h"
+#include "modules/ir/otherIRcodes.h"
+#include "modules/ir/tvbgone.h"
+// ... keep whatever includes your original file had, plus ir_cycle.h
 
 void IRMenu::optionsMenu() {
 #if defined(ARDUINO_M5STICK_S3)
     bool prevPower = M5.Power.getExtOutput();
     M5.Power.setExtOutput(true); // ENABLE 5V OUTPUT
 #endif
-    options = {
-        {"TV-B-Gone", StartTvBGone              },
-        {"Custom IR", otherIRcodes              },
-        {"IR Read",   [=]() { IrRead(); }       },
+
+    options.clear();
+
+    /*
+     * Infrared main menu
+     *
+     *   - Custom IR
+     *   - Attacks
+     *   - Sniffers
+     *   - Config
+     */
+
+    // =========================================================
+    // CUSTOM IR (top level)
+    // =========================================================
+    options.push_back({"Custom IR", otherIRcodes});
+
+    // =========================================================
+    // ATTACKS
+    // =========================================================
+    options.push_back({"Attacks", [this]() {
+                           std::vector<Option> attackOptions;
+
+                           attackOptions.push_back({"TV-B-Gone", StartTvBGone});
+
 #if !defined(LITE_VERSION)
-        {"IR Jammer", startIrJammer             }, // Simple frequency-adjustable jammer
+                           attackOptions.push_back({"IR Cycle", startIrCycle});  // brute-force command scanner
+
+                           attackOptions.push_back({"IR Jammer", startIrJammer});
 #endif
-        {"Config",    [this]() { configMenu(); }},
-    };
+
+                           attackOptions.push_back({"Back", [this]() { optionsMenu(); }});
+
+                           loopOptions(attackOptions, MENU_TYPE_SUBMENU, "Attacks");
+                       }});
+
+
+    // =========================================================
+    // SNIFFERS
+    // =========================================================
+    options.push_back({"Sniffers", [this]() {
+                           std::vector<Option> snifferOptions;
+
+                           snifferOptions.push_back({"IR Read", [=]() { IrRead(); }});
+
+                           snifferOptions.push_back({"Back", [this]() { optionsMenu(); }});
+
+                           loopOptions(snifferOptions, MENU_TYPE_SUBMENU, "Sniffers");
+                       }});
+
+
+    // =========================================================
+    // CONFIG (at the very bottom)
+    // =========================================================
+    options.push_back({"Config", [this]() { configMenu(); }});
+
     addOptionToMainMenu();
 
     String txt = "Infrared";
-    txt += " Tx: " + String(bruceConfigPins.irTx) + " Rx: " + String(bruceConfigPins.irRx) +
-           " Rpts: " + String(bruceConfigPins.irTxRepeats);
+    txt += " Tx: " + String(bruceConfigPins.irTx)
+         + " Rx: " + String(bruceConfigPins.irRx)
+         + " Rpts: " + String(bruceConfigPins.irTxRepeats);
+
     loopOptions(options, MENU_TYPE_SUBMENU, txt.c_str());
+
 #if defined(ARDUINO_M5STICK_S3)
     M5.Power.setExtOutput(prevPower);
 #endif
+
+    options.clear();
 }
 
 void IRMenu::configMenu() {
