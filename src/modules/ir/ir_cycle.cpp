@@ -241,14 +241,19 @@ static void sendCycleCommand(IRsend &irsend, decode_type_t proto,
             );
             irsend.sendPanasonic64(data, 48);
             break;
-        case JVC:
-            data = irsend.encodeJVC(address, command);
-            irsend.sendJVC(data, 16);
-            break;
-        case SHARP:
-            data = irsend.encodeSharp(address, command);
-            irsend.sendSharp(address, command);
-            break;
+
+        #if defined(SEND_JVC)
+                case JVC:
+                    data = irsend.encodeJVC(address, command);
+                    irsend.sendJVC(data, 16);
+                    break;
+        #endif
+        #if defined(SEND_SHARP)
+                case SHARP:
+                    data = irsend.encodeSharp(address, command);
+                    irsend.sendSharp(address, command);
+                    break;
+        #endif
         default:
             // Fallback: send as NEC
             data = irsend.encodeNEC(address, command);
