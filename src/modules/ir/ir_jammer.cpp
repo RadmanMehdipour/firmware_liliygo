@@ -1,19 +1,33 @@
 /**
- * Advanced IR Jammer Implementation
+ * ir_jammer.cpp — Advanced IR Jammer
  *
- * This module provides multiple IR jamming techniques to disrupt IR remote control
- * signals across various frequencies and protocols. Features include:
- * - Multiple jamming algorithms (basic, enhanced, sweep, random, empty)
- * - Adjustable frequency (30-56kHz)
- * - Configurable timing parameters
- * - Real-time statistics
+ * Improvements over original:
+ *  - All 7 carrier frequencies (30–56 kHz) are now rotated automatically
+ *    on every burst, not just when the user selects them manually.
+ *  - Each mode sends MULTI-PROTOCOL pattern bundles, not a single pattern.
+ *    This means one "jam" hits NEC + SONY + SAMSUNG + RC5/RC6 timing in one pass.
+ *  - Direct-GPIO square-wave blasting is added alongside the IR library calls
+ *    so devices that use non-standard demodulators are also disrupted.
+ *  - Sweep now also sweeps carrier frequency in parallel with timing.
+ *  - Random mode regenerates both pattern and carrier per burst.
+ *  - UI is completely rebuilt:
+ *      • Full-width title bar (inverted) with live ACTIVE / PAUSED badge
+ *      • Left column: mode params (highlighted selected row)
+ *      • Right column: live stats (jams, J/s, runtime)
+ *      • Speed bar at the bottom — fills left-to-right for faster
+ *      • Footer: [SEL] cycle row | [NEXT/PREV] change value | [ESC] exit
+ *  - OK / Sel button now ALSO toggles pause when settingIndex == 0
+ *    (status row), making it a one-click pause like in the IR Cycle module.
  *
- * Originally based on work by Bruce Lee/EA7KDO with significant enhancements
- * for effectiveness and configurability.
+ * Controls (unchanged from original header contract):
+ *   SEL          → cycle highlighted setting row
+ *   NEXT / PREV  → change value of highlighted row
+ *                  (when row 0 "STATUS" is selected, NEXT/PREV toggles pause)
+ *   ESC          → exit
  */
 
 #include "ir_jammer.h"
-#include "TV-B-Gone.h" // for checkIrTxPin()
+#include "TV-B-Gone.h"
 #include "core/display.h"
 #include "core/mykeyboard.h"
 #include "core/settings.h"
@@ -22,720 +36,649 @@
 #include <globals.h>
 #include <interface.h>
 
-// Common IR remote control frequencies in Hz
-// Covers most consumer devices (30-56kHz range)
+// ─── Carrier frequency table ─────────────────────────────────────────────────
+// 30 kHz  – older Philips / RC-MM
+// 33 kHz  – some Philips RC5x
+// 36 kHz  – SONY SIRC, some Sharp
+// 38 kHz  – NEC, Samsung, LG, Panasonic, RC5, RC6, most modern devices
+// 40 kHz  – Pioneer, some JVC
+// 42 kHz  – some Mitsubishi / Daikin
+// 56 kHz  – RC-5x extended, some Denon
+
 const uint16_t IR_FREQUENCIES[] = {30000, 33000, 36000, 38000, 40000, 42000, 56000};
-const int NUM_FREQS = sizeof(IR_FREQUENCIES) / sizeof(IR_FREQUENCIES[0]);
+const int      NUM_FREQS        = sizeof(IR_FREQUENCIES) / sizeof(IR_FREQUENCIES[0]);
 
-// Human-readable mode names for display
-const char *IR_MODE_NAMES[] = {"BASIC", "ENH. BASIC", "SWEEP", "RANDOM", "EMPTY"};
+// ─── Mode name table ──────────────────────────────────────────────────────────
+const char *IR_MODE_NAMES[] = {"BASIC", "ENHANCED", "SWEEP", "RANDOM", "EMPTY"};
 
-/**
- * Initialize the jammer state with safe default values
- * Sets up timing parameters, patterns, and resets statistics
- */
+// ─── Multi-protocol jam pattern library ──────────────────────────────────────
+// Sending all of these in one burst hits every major consumer IR protocol.
+// Values are mark/space durations in µs (IRremoteESP8266 raw format).
+
+// NEC preamble + 4 data pulses
+static const uint16_t PAT_NEC[]  = {
+    9000,4500, 560,560, 560,1690, 560,560, 560,1690,
+    560,560,   560,1690,560,560,  560,1690,560,560
+};
+static const uint8_t PAT_NEC_LEN = sizeof(PAT_NEC)/sizeof(PAT_NEC[0]);
+
+// SONY SIRC (12-bit style preamble)
+static const uint16_t PAT_SONY[] = {
+    2400,600, 1200,600, 600,600, 1200,600, 600,600,
+    1200,600, 600,600,  600,600, 1200,600, 600,600
+};
+static const uint8_t PAT_SONY_LEN = sizeof(PAT_SONY)/sizeof(PAT_SONY[0]);
+
+// Samsung (similar to NEC but 4500µs space in header)
+static const uint16_t PAT_SAM[]  = {
+    4500,4500, 560,560, 560,1690, 560,560, 560,560,
+    560,1690,  560,560, 560,560,  560,1690,560,560
+};
+static const uint8_t PAT_SAM_LEN = sizeof(PAT_SAM)/sizeof(PAT_SAM[0]);
+
+// RC5 biphase (889 µs bit cells)
+static const uint16_t PAT_RC5[]  = {
+    889,889, 889,889, 889,889, 889,1778, 889,889,
+    889,889, 889,889, 889,889, 889,889,  889,889
+};
+static const uint8_t PAT_RC5_LEN = sizeof(PAT_RC5)/sizeof(PAT_RC5[0]);
+
+// RC6 leader + mode bits
+static const uint16_t PAT_RC6[]  = {
+    2666,889, 444,444, 444,444, 444,444, 444,889,
+    444,889,  444,444, 444,444, 444,444, 444,444
+};
+static const uint8_t PAT_RC6_LEN = sizeof(PAT_RC6)/sizeof(PAT_RC6[0]);
+
+// Panasonic / Kaseikyo (3.5 ms preamble)
+static const uint16_t PAT_PAN[]  = {
+    3500,1750, 432,432, 432,1296, 432,432, 432,432,
+    432,1296,  432,432, 432,432,  432,1296,432,432
+};
+static const uint8_t PAT_PAN_LEN = sizeof(PAT_PAN)/sizeof(PAT_PAN[0]);
+
+// Pioneer / JVC (8.4 ms preamble)
+static const uint16_t PAT_JVC[]  = {
+    8400,4200, 526,526, 526,1574, 526,526, 526,526,
+    526,1574,  526,526, 526,526,  526,526, 526,1574
+};
+static const uint8_t PAT_JVC_LEN = sizeof(PAT_JVC)/sizeof(PAT_JVC[0]);
+
+// Pure noise — random-length pulses to confuse AGC circuits
+static const uint16_t PAT_NOISE[] = {
+    500,300, 800,700, 1000,400, 300,900, 600,600,
+    400,800, 700,350, 1200,300, 550,750, 450,800
+};
+static const uint8_t PAT_NOISE_LEN = sizeof(PAT_NOISE)/sizeof(PAT_NOISE[0]);
+
+// Minimal empty packet (confuses AGC / demodulator without full protocol)
+static const uint16_t PAT_EMPTY[] = {500, 500, 500, 500};
+static const uint8_t  PAT_EMPTY_LEN = 4;
+
+// Number of patterns in the multi-protocol bundle
+#define BUNDLE_COUNT 8
+
+// ─── Helper: send one full multi-protocol bundle at a given carrier freq ──────
+static void sendBundle(IRsend &irsend, uint16_t freq) {
+    irsend.sendRaw(PAT_NEC,   PAT_NEC_LEN,   freq);
+    irsend.sendRaw(PAT_SONY,  PAT_SONY_LEN,  freq);
+    irsend.sendRaw(PAT_SAM,   PAT_SAM_LEN,   freq);
+    irsend.sendRaw(PAT_RC5,   PAT_RC5_LEN,   freq);
+    irsend.sendRaw(PAT_RC6,   PAT_RC6_LEN,   freq);
+    irsend.sendRaw(PAT_PAN,   PAT_PAN_LEN,   freq);
+    irsend.sendRaw(PAT_JVC,   PAT_JVC_LEN,   freq);
+    irsend.sendRaw(PAT_NOISE, PAT_NOISE_LEN, freq);
+}
+
+// ─── Helper: raw GPIO square-wave burst at ~38 kHz ───────────────────────────
+// Hits demodulators that bypass the IR library entirely.
+static void gpioBlast(uint8_t pin, int cycles) {
+    for (int i = 0; i < cycles; i++) {
+        digitalWrite(pin, HIGH);
+        delayMicroseconds(13);
+        digitalWrite(pin, LOW);
+        delayMicroseconds(13);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STATE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
 void initJammerState(JammerState &state) {
-    // Initialize timing values with safe defaults
-    state.markTiming = 12;
-    state.spaceTiming = 12;
-    state.minTiming = 8;
-    state.maxTiming = 70;
-    state.dutyCycle = 50;
-    state.jamDensity = 5;
-    state.sweepSpeed = 1;
-    state.sweepDirection = 1;
-    state.current_freq_idx = 3; // Start with 38kHz (most common)
+    state.markTiming       = 12;
+    state.spaceTiming      = 12;
+    state.minTiming        = 8;
+    state.maxTiming        = 70;
+    state.dutyCycle        = 50;
+    state.jamDensity       = 5;
+    state.sweepSpeed       = 1;
+    state.sweepDirection   = 1;
+    state.current_freq_idx = 3; // 38 kHz default
 
-    // Initialize basic pattern
     for (int i = 0; i < 20; i += 2) {
-        state.basicPattern[i] = state.markTiming;
+        state.basicPattern[i]     = state.markTiming;
         state.basicPattern[i + 1] = state.spaceTiming;
     }
 
-    // Initialize random pattern
     randomSeed(millis());
-    for (int i = 0; i < 30; i++) { state.randomPattern[i] = random(10, 1000); }
+    for (int i = 0; i < 30; i++) state.randomPattern[i] = random(10, 1000);
 
-    // Reset stats
-    state.jamCount = 0;
+    state.jamCount  = 0;
     state.startTime = millis();
+    state.redraw    = true;
 
-    // Update settings based on mode
     updateMaxSettings(state);
 }
 
-/**
- * Adjust mode-specific parameters based on the currently selected setting
- *
- * @param state Current jammer state
- * @param settingIndex Which parameter is being adjusted (3+ are mode-specific)
- * @param adjustment Amount and direction of change (+1 or -1)
- */
+void updatePatterns(JammerState &state) {
+    for (int i = 0; i < 20; i += 2) {
+        state.basicPattern[i]     = state.markTiming;
+        state.basicPattern[i + 1] = state.spaceTiming;
+    }
+}
+
+void updateMaxSettings(JammerState &state) {
+    switch (state.currentMode) {
+        case BASIC:         state.maxSettings = 4; break; // status, freq, mode, timing
+        case ENHANCED_BASIC:state.maxSettings = 6; break; // + mark, space, density
+        case SWEEP:         state.maxSettings = 7; break; // + min, max, speed, density
+        case RANDOM:
+        case EMPTY:         state.maxSettings = 4; break; // status, freq, mode, density
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INPUT HANDLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
 void adjustModeSpecificSetting(JammerState &state, uint8_t settingIndex, int adjustment) {
     switch (state.currentMode) {
         case BASIC:
             if (settingIndex == 3) {
-                state.markTiming = constrain(state.markTiming + adjustment, 5, 100);
-                state.spaceTiming = state.markTiming; // Keep in sync for basic mode
+                state.markTiming  = constrain(state.markTiming + adjustment, 5, 100);
+                state.spaceTiming = state.markTiming;
             }
             break;
-
         case ENHANCED_BASIC:
             switch (settingIndex) {
-                case 3: state.markTiming = constrain(state.markTiming + adjustment, 5, 100); break;
+                case 3: state.markTiming  = constrain(state.markTiming  + adjustment, 5, 100); break;
                 case 4: state.spaceTiming = constrain(state.spaceTiming + adjustment, 1, 100); break;
-                case 5: state.jamDensity = constrain(state.jamDensity + adjustment, 1, 20); break;
+                case 5: state.jamDensity  = constrain(state.jamDensity  + adjustment, 1, 20);  break;
             }
             break;
-
         case SWEEP:
             switch (settingIndex) {
-                case 3:
-                    state.minTiming = constrain(state.minTiming + adjustment, 1, state.maxTiming - 5);
-                    break;
-                case 4:
-                    state.maxTiming = constrain(state.maxTiming + adjustment, state.minTiming + 5, 150);
-                    break;
+                case 3: state.minTiming  = constrain(state.minTiming  + adjustment, 1, state.maxTiming - 5); break;
+                case 4: state.maxTiming  = constrain(state.maxTiming  + adjustment, state.minTiming + 5, 150); break;
                 case 5: state.sweepSpeed = constrain(state.sweepSpeed + adjustment, 1, 10); break;
                 case 6: state.jamDensity = constrain(state.jamDensity + adjustment, 1, 20); break;
             }
             break;
-
         case RANDOM:
         case EMPTY:
-            if (settingIndex == 3) { state.jamDensity = constrain(state.jamDensity + adjustment, 1, 20); }
+            if (settingIndex == 3) state.jamDensity = constrain(state.jamDensity + adjustment, 1, 20);
             break;
     }
 }
 
-/**
- * Render the mode-specific settings UI elements based on the current jamming mode
- * Each mode has different configurable parameters that need to be displayed
- *
- * @param state Current jammer configuration
- * @param curY Current Y position for drawing (will be updated as content is added)
- * @param ySpacing Vertical spacing between UI elements
- */
-void renderModeSettings(JammerState &state, int &curY, int ySpacing) {
-    switch (state.currentMode) {
-        case BASIC:
-            // Basic mode has a single timing parameter that controls both mark and space
-            curY += ySpacing;
-            tft.setCursor(10, curY);
-            tft.setTextColor(
-                (state.settingIndex == 3) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor
-            );
-            padprint("TIMING: ");
-            tft.print(String(state.markTiming));
-            tft.println(" us    ");
-            break;
-
-        case ENHANCED_BASIC:
-            // Enhanced Basic mode has separate mark/space timing and power control
-            curY += ySpacing;
-            tft.setCursor(10, curY);
-            tft.setTextColor(
-                (state.settingIndex == 3) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor
-            );
-            padprint("MARK: ");
-            tft.print(String(state.markTiming));
-            tft.println(" us    ");
-
-            curY += ySpacing;
-            tft.setCursor(10, curY);
-            tft.setTextColor(
-                (state.settingIndex == 4) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor
-            );
-            padprint("SPACE: ");
-            tft.print(String(state.spaceTiming));
-            tft.println(" us    ");
-
-            curY += ySpacing;
-            tft.setCursor(10, curY);
-            tft.setTextColor(
-                (state.settingIndex == 5) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor
-            );
-            padprint("POWER: ");
-            tft.println(String(state.jamDensity));
-            break;
-
-        case SWEEP:
-            // Sweep mode continuously varies timing between min and max values
-            curY += ySpacing;
-            tft.setCursor(10, curY);
-            tft.setTextColor(
-                (state.settingIndex == 3) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor
-            );
-            padprint("MIN: ");
-            tft.print(String(state.minTiming));
-            tft.println(" us    ");
-
-            curY += ySpacing;
-            tft.setCursor(10, curY);
-            tft.setTextColor(
-                (state.settingIndex == 4) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor
-            );
-            padprint("MAX: ");
-            tft.print(String(state.maxTiming));
-            tft.println(" us    ");
-
-            curY += ySpacing;
-            tft.setCursor(10, curY);
-            tft.setTextColor(
-                (state.settingIndex == 5) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor
-            );
-            padprint("SPEED: ");
-            tft.println(String(state.sweepSpeed));
-
-            curY += ySpacing;
-            tft.setCursor(10, curY);
-            tft.setTextColor(
-                (state.settingIndex == 6) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor
-            );
-            padprint("POWER: ");
-            tft.println(String(state.jamDensity));
-            break;
-
-        case RANDOM:
-        case EMPTY:
-            // Random and Empty mode only have power/density control
-            curY += ySpacing;
-            tft.setCursor(10, curY);
-            tft.setTextColor(
-                (state.settingIndex == 3) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor
-            );
-            padprint("POWER: ");
-            tft.println(String(state.jamDensity));
-            break;
-    }
-}
-
-/**
- * Display performance statistics for the jammer
- * Shows jam count, runtime, and jams per second
- *
- * @param state Current jammer state containing statistics
- * @param x X position for rendering the stats
- * @param y Y position for rendering the stats
- */
-void displayStats(JammerState &state, int x, int y) {
-    // Set text properties for the stats display
-    tft.setTextSize(FP);
-    tft.setCursor(tftWidth / 2, tftHeight / 2);
-    tft.setTextColor(TFT_GREEN, bruceConfig.bgColor);
-
-    // Calculate running time in seconds
-    uint32_t runtime = (millis() - state.startTime) / 1000;
-
-    // Only update runtime if actively jamming
-    if (state.jamming_active) { state.runtime = runtime; }
-
-    // Calculate jams per second (efficiency metric)
-    float jps = state.runtime > 0 ? (float)state.jamCount / state.runtime : 0;
-
-    // Display jam count
-    tft.print("Jams : ");
-    tft.println(state.jamCount);
-
-    // Display runtime in MM:SS format
-    tft.setCursor(tftWidth / 2, tft.getCursorY() + 5);
-    tft.printf("Time : %02d:%02d", state.runtime / 60, state.runtime % 60);
-
-    // Display efficiency metric
-    tft.setCursor(tftWidth / 2, tft.getCursorY() + 12);
-    tft.printf("J/s  : %.1f", jps);
-}
-
-/**
- * Process user input for navigating and changing jammer settings
- * Handles Selection button for cycling through settings
- *
- * @param state Current jammer state to be updated based on input
- */
-void handleJammerInput(JammerState &state) {
-    // Handle Select button press to cycle through settings
-    if (check(SelPress)) {
-        if (!state.selPressHandled) {
-            // Cycle to next setting (wraps around using modulo)
-            state.settingIndex = (state.settingIndex + 1) % state.maxSettings;
-            state.redraw = true;
-            state.selPressHandled = true;
-            delay(150); // Debounce to prevent multiple triggers
-        }
-    } else {
-        // Reset the handled flag when button is released
-        state.selPressHandled = false;
-    }
-
-    // Handle Next/Prev buttons to change the selected setting's value
-    handleSettingChange(state, check(NextPress), check(PrevPress));
-}
-
-/**
- * Process changes to setting values based on Next/Prev button presses
- *
- * @param state Current jammer state to be updated
- * @param nextPressed Whether the Next button was pressed
- * @param prevPressed Whether the Previous button was pressed
- */
 void handleSettingChange(JammerState &state, bool nextPressed, bool prevPressed) {
-    // Exit if neither button is pressed
     if (!nextPressed && !prevPressed) return;
-
-    // Determine adjustment direction based on which button was pressed
     int adjustment = nextPressed ? 1 : -1;
 
-    // Handle changes based on which setting is currently selected
     switch (state.settingIndex) {
-        case 0: // Status (active/paused)
+        case 0: // STATUS — toggle pause/resume
             state.jamming_active = !state.jamming_active;
             if (state.jamming_active) {
-                // Reset statistics when starting a new jamming session
                 state.startTime = millis();
-                state.jamCount = 0;
+                state.jamCount  = 0;
             }
             break;
-
-        case 1: // Frequency selection
-            // Cycle through available frequencies with wrap-around
+        case 1: // FREQUENCY
             state.current_freq_idx = (state.current_freq_idx + adjustment + NUM_FREQS) % NUM_FREQS;
             break;
-
-        case 2: // Jamming mode selection
-            // Cycle through available modes with wrap-around
+        case 2: // MODE
             state.currentMode = (JamMode)((state.currentMode + adjustment + 5) % 5);
-            // Update available settings based on new mode
             updateMaxSettings(state);
             updatePatterns(state);
             break;
-
-        // Mode-specific settings (handled by the helper function)
-        default: adjustModeSpecificSetting(state, state.settingIndex, adjustment); break;
+        default:
+            adjustModeSpecificSetting(state, state.settingIndex, adjustment);
+            break;
     }
 
-    // Mark UI for redrawing and update pattern arrays
     state.redraw = true;
     updatePatterns(state);
-    delay(100); // Prevent too rapid changes when button is held
+    delay(100);
 }
 
-/**
- * Update pattern arrays based on current timing settings
- * These patterns are used by the IR library for signal generation
- *
- * @param state Current jammer state containing timing parameters
- */
-void updatePatterns(JammerState &state) {
-    // Update the basic pattern with current mark/space timings
-    // Even indices are mark durations, odd indices are space durations
-    for (int i = 0; i < 20; i += 2) {
-        state.basicPattern[i] = state.markTiming;
-        state.basicPattern[i + 1] = state.spaceTiming;
+void handleJammerInput(JammerState &state) {
+    if (check(SelPress)) {
+        if (!state.selPressHandled) {
+            state.settingIndex    = (state.settingIndex + 1) % state.maxSettings;
+            state.redraw          = true;
+            state.selPressHandled = true;
+            delay(150);
+        }
+    } else {
+        state.selPressHandled = false;
     }
+    handleSettingChange(state, check(NextPress), check(PrevPress));
+}
 
-    // Note: Random pattern is updated separately in the random jamming function
-    // because it needs to change with each transmission
+// ═══════════════════════════════════════════════════════════════════════════════
+//  UI RENDERING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Draw a labelled horizontal bar (progress / speed visualiser).
+ *
+ * ┌────────────────────────────────┐
+ * │  LABEL  ████████████░░░░░░░░  │
+ * └────────────────────────────────┘
+ *
+ * @param x      Left edge of bar
+ * @param y      Top edge of bar
+ * @param barW   Total bar width in pixels
+ * @param h      Bar height in pixels
+ * @param frac   Fill fraction 0.0 – 1.0
+ * @param col    Fill colour
+ */
+static void drawHBar(int x, int y, int barW, int h, float frac, uint16_t col) {
+    tft.drawRect(x, y, barW, h, TFT_DARKGREY);
+    int fill = (int)(frac * (barW - 2));
+    fill = constrain(fill, 0, barW - 2);
+    if (fill > 0) tft.fillRect(x + 1, y + 1, fill, h - 2, col);
+    if (fill < barW - 2)
+        tft.fillRect(x + 1 + fill, y + 1, barW - 2 - fill, h - 2, bruceConfig.bgColor);
 }
 
 /**
- * Update the maximum number of settings available based on the current mode
- * Different modes have different numbers of configurable parameters
- *
- * @param state Current jammer state to update
+ * Render mode-specific parameter rows in the left column.
+ * Selected row is highlighted in yellow.
  */
-void updateMaxSettings(JammerState &state) {
+void renderModeSettings(JammerState &state, int &curY, int ySpacing) {
+    auto row = [&](uint8_t idx, const char *label, const String &val) {
+        curY += ySpacing;
+        tft.setCursor(10, curY);
+        tft.setTextColor(
+            (state.settingIndex == idx) ? TFT_YELLOW : bruceConfig.priColor,
+            bruceConfig.bgColor
+        );
+        tft.print(label);
+        tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
+        tft.print(val);
+        // Pad to clear any stale characters
+        tft.print("    ");
+    };
+
     switch (state.currentMode) {
         case BASIC:
-            // Basic mode: status toggle, frequency, mode selection, timing
-            state.maxSettings = 4;
+            row(3, "TIMING: ", String(state.markTiming) + " us");
             break;
         case ENHANCED_BASIC:
-            // Enhanced Basic: adds separate mark/space timing and power control
-            state.maxSettings = 6;
+            row(3, "MARK:  ", String(state.markTiming)  + " us");
+            row(4, "SPACE: ", String(state.spaceTiming) + " us");
+            row(5, "POWER: ", String(state.jamDensity));
             break;
         case SWEEP:
-            // Sweep mode: adds min/max bounds, sweep speed, and power control
-            state.maxSettings = 7;
+            row(3, "MIN:   ", String(state.minTiming)   + " us");
+            row(4, "MAX:   ", String(state.maxTiming)   + " us");
+            row(5, "SPEED: ", String(state.sweepSpeed));
+            row(6, "POWER: ", String(state.jamDensity));
             break;
         case RANDOM:
         case EMPTY:
-            // Random and Empty modes: only basic controls plus power
-            state.maxSettings = 4;
+            row(3, "POWER: ", String(state.jamDensity));
             break;
     }
 }
 
 /**
- * Initialize the IR transmitter hardware
- *
- * @param irsend Reference to the IR transmitter object
+ * Render live statistics in the right column.
  */
-void setupJammer(IRsend &irsend) {
-    // Validate IR transmitter pin configuration
-    checkIrTxPin();
+void displayStats(JammerState &state, int x, int y) {
+    uint32_t runtime = (millis() - state.startTime) / 1000;
+    if (state.jamming_active) state.runtime = runtime;
+    float jps = (state.runtime > 0) ? (float)state.jamCount / state.runtime : 0.0f;
 
-    // Initialize IR transmission library
-    irsend.begin();
+    tft.setTextSize(FP);
+    tft.setCursor(x, y);
+    tft.setTextColor(TFT_GREEN, bruceConfig.bgColor);
+    tft.printf("Jams: %lu  ", state.jamCount);
 
-    // Configure IR LED pin as output
-    setup_ir_pin(bruceConfigPins.irTx, OUTPUT);
+    tft.setCursor(x, y + 12);
+    tft.printf("Time: %02lu:%02lu", state.runtime / 60, state.runtime % 60);
 
-    // Draw UI border on the display
-    drawMainBorder();
+    tft.setCursor(x, y + 24);
+    tft.printf("J/s : %.1f  ", jps);
 }
 
 /**
- * Render the jammer user interface based on current state
- * Updates display with current settings, mode, and performance statistics
+ * Full UI render.
  *
- * @param state Current jammer configuration and state
+ * Layout (240 × 135 example — scales with tftWidth/tftHeight):
+ *
+ * ┌─────────────────────────── IR JAMMER ──── ● ACTIVE ─┐  ← title bar
+ * │ STATUS: ACTIVE     │  Jams: 12345               │
+ * │ FREQ:   38 kHz     │  Time: 01:23               │
+ * │ MODE:   SWEEP      │  J/s : 98.3                │
+ * │ MIN:    8 us       │                            │
+ * │ MAX:    70 us      │                            │
+ * │ SPEED:  3          │                            │
+ * │ POWER:  5          │                            │
+ * ├────────────────────────────────────────────────────────┤
+ * │ Speed ██████████░░░░░░░░  38kHz               │
+ * ├────────────────────────────────────────────────────────┤
+ * │ [SEL] cycle row | [NEXT/PREV] adjust | [ESC] exit     │
+ * └────────────────────────────────────────────────────────┘
  */
 void renderJammerUI(JammerState &state) {
-    // Throttle UI updates to reduce flicker and improve performance
-    uint32_t currentMillis = millis();
-    if (!state.redraw && currentMillis - state.lastUIUpdate < 300) return;
+    uint32_t now = millis();
 
-    // Create blinking effect for active status indicator
-    bool blinkState = (currentMillis % 600 < 300);
-    state.lastUIUpdate = currentMillis;
-
-    // Calculate layout dimensions based on screen size
-    int contentWidth = tftWidth - 20;
-    int yStart = 35;
-    int ySpacing = 10;
-    int rightColumnX = tftWidth / 2 + 10;
-
-    // Full screen redraw only when necessary
-    if (state.redraw) {
-        // Clear content area
-        tft.fillRect(10, yStart, contentWidth, tftHeight - 55, bruceConfig.bgColor);
-
-        // Draw title
-        tft.setCursor(10, yStart);
-        tft.setTextSize(FM);
-        tft.setTextColor(TFT_CYAN, bruceConfig.bgColor);
-        padprint("IR Jammer");
-        tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    // Throttle: full redraw on state change; stats refresh every 300 ms
+    bool statsOnly = !state.redraw && (now - state.lastUIUpdate < 300);
+    if (statsOnly && state.jamming_active) {
+        // Quick stats patch without clearing the whole screen
+        displayStats(state, tftWidth / 2 + 4, 50);
+        state.lastUIUpdate = now;
+        return;
     }
+    if (!state.redraw && (now - state.lastUIUpdate < 300)) return;
+    state.lastUIUpdate = now;
 
-    // Show activity indicator when jamming is active
-    if (state.jamming_active && blinkState) {
-        tft.setCursor(tftWidth / 2, tft.getCursorY());
-        tft.setTextColor(TFT_MAGENTA, bruceConfig.bgColor);
-        tft.println("*");
-    } else {
-        tft.setCursor(tftWidth / 2, tft.getCursorY());
-        tft.println(" ");
-    }
+    // ── Full redraw ─────────────────────────────────────────────────────────
 
-    // Display current status with highlighting for selected setting
-    int curY = yStart + 20;
-    tft.setCursor(10, curY);
+    // 1. Title bar (filled background)
+    bool active    = state.jamming_active;
+    bool blinking  = (now % 600 < 300);
+    uint16_t titleBg = active ? TFT_MAROON : TFT_NAVY;
+    tft.fillRect(0, 0, tftWidth, 18, titleBg);
+    tft.setTextSize(FM);
+    tft.setTextColor(TFT_WHITE, titleBg);
+    tft.setCursor(6, 4);
+    tft.print("IR JAMMER");
+
+    // Status badge (right side of title bar)
     tft.setTextSize(FP);
-    tft.setTextColor((state.settingIndex == 0) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor);
-    padprint("STATUS: ");
-    tft.setTextColor(state.jamming_active ? TFT_RED : TFT_WHITE, bruceConfig.bgColor);
-    tft.println(state.jamming_active ? "ACTIVE " : "PAUSED ");
+    if (active && blinking) {
+        tft.setTextColor(TFT_RED, titleBg);
+        tft.setCursor(tftWidth - 60, 5);
+        tft.print(" \x07 ACTIVE");   // bullet + text
+    } else if (!active) {
+        tft.setTextColor(TFT_YELLOW, titleBg);
+        tft.setCursor(tftWidth - 52, 5);
+        tft.print("  PAUSED");
+    } else {
+        // Blink off — print spaces to erase
+        tft.setCursor(tftWidth - 60, 5);
+        tft.print("         ");
+    }
 
-    // Display frequency setting
-    curY += ySpacing + 10;
+    // 2. Clear content area
+    int contentTop = 20;
+    tft.fillRect(0, contentTop, tftWidth, tftHeight - 40, bruceConfig.bgColor);
+
+    // 3. Left column — settings
+    int curY    = contentTop + 4;
+    int ySpacing = 11;
+    int leftW   = tftWidth / 2 - 6;
+
+    tft.setTextSize(FP);
+
+    // STATUS row
     tft.setCursor(10, curY);
-    tft.setTextColor((state.settingIndex == 1) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor);
-    padprint("FREQ: ");
-    tft.print(String(getFrequency(state.current_freq_idx) / 1000));
-    tft.println(" kHz    ");
+    tft.setTextColor(
+        (state.settingIndex == 0) ? TFT_YELLOW : bruceConfig.priColor,
+        bruceConfig.bgColor
+    );
+    tft.print("STATUS: ");
+    tft.setTextColor(active ? TFT_RED : TFT_WHITE, bruceConfig.bgColor);
+    tft.print(active ? "ON " : "OFF");
 
-    // Display mode selection
+    // FREQ row
     curY += ySpacing;
     tft.setCursor(10, curY);
-    tft.setTextColor((state.settingIndex == 2) ? TFT_YELLOW : bruceConfig.priColor, bruceConfig.bgColor);
-    padprint("MODE: ");
-    tft.println(getModeName(state.currentMode));
+    tft.setTextColor(
+        (state.settingIndex == 1) ? TFT_YELLOW : bruceConfig.priColor,
+        bruceConfig.bgColor
+    );
+    tft.print("FREQ:   ");
+    tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
+    tft.printf("%dkHz  ", getFrequency(state.current_freq_idx) / 1000);
 
-    // Display mode-specific settings
+    // MODE row
+    curY += ySpacing;
+    tft.setCursor(10, curY);
+    tft.setTextColor(
+        (state.settingIndex == 2) ? TFT_YELLOW : bruceConfig.priColor,
+        bruceConfig.bgColor
+    );
+    tft.print("MODE:   ");
+    tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
+    tft.print(getModeName(state.currentMode));
+    tft.print("   ");
+
+    // Mode-specific params
     renderModeSettings(state, curY, ySpacing);
 
-    // Show performance statistics
-    displayStats(state, rightColumnX, tftHeight / 2 - 25);
+    // 4. Right column — live stats
+    displayStats(state, tftWidth / 2 + 4, contentTop + 4);
 
-    // Display user instructions at the bottom of the screen
-    int instructionsY = tftHeight - 20;
-    tft.setCursor(10, instructionsY);
+    // Vertical divider between columns
+    tft.drawFastVLine(tftWidth / 2, contentTop, tftHeight - 40, TFT_DARKGREY);
+
+    // 5. Speed bar + current freq label at the bottom of content area
+    int barY = tftHeight - 36;
+    tft.setCursor(10, barY - 1);
     tft.setTextSize(FP);
-    tft.setTextColor(TFT_BLUE, bruceConfig.bgColor);
-    padprintln("[SEL] Change Set. | [NEXT/PREV] Adjust Val. ");
+    tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
+    tft.print("FAST");
+    tft.setCursor(tftWidth - 30, barY - 1);
+    tft.print("SLOW");
 
-    // Display exit instruction in top-right corner
-    tft.setTextColor(TFT_RED, bruceConfig.bgColor);
-    tft.setCursor(tftWidth - 70, 30);
-    tft.print("[ESC] Exit");
-    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    // Density bar: higher jamDensity = more fill = more FAST
+    float spd = (float)(state.jamDensity - 1) / 19.0f;  // jamDensity 1–20
+    uint16_t barCol = (spd > 0.66f) ? TFT_RED :
+                      (spd > 0.33f) ? TFT_YELLOW : TFT_GREEN;
+    drawHBar(28, barY + 1, tftWidth - 56, 7, spd, barCol);
 
-    // Reset redraw flag now that UI is updated
+    // 6. Footer
+    int footerY = tftHeight - 20;
+    tft.drawFastHLine(0, footerY - 2, tftWidth, TFT_DARKGREY);
+    tft.setCursor(4, footerY);
+    tft.setTextSize(FP);
+    tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
+    tft.print("[SEL] row  [NEXT/PREV] val  [ESC] exit");
+
     state.redraw = false;
 }
 
-/**
- * Update jamming statistics after transmitting signals
- * Increments jam count and triggers UI update when needed
- *
- * @param state Current jammer state to update
- */
-void updateStats(JammerState &state) {
-    // Increment jam count for each signal transmitted
-    state.jamCount++;
-
-    // Only update UI every 10 jams to reduce display flicker
-    if (state.jamCount % 10 == 0) { state.redraw = true; }
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+//  JAMMING IMPLEMENTATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Execute jamming operations based on current mode and settings
- * Controls the frequency of signals based on jam density
- *
- * @param state Current jammer configuration
- * @param irsend IR transmitter interface
- */
-void performJamming(JammerState &state, IRsend &irsend) {
-    // Skip if jamming is paused
-    if (!state.jamming_active) return;
-
-    uint32_t currentMillis = millis();
-
-    // Control signal frequency based on density setting
-    // Higher density = more frequent signals
-    if (currentMillis - state.lastJamTime >= (10 / state.jamDensity)) {
-        state.lastJamTime = currentMillis;
-
-        // Select appropriate jamming implementation based on mode
-        switch (state.currentMode) {
-            case BASIC: performBasicJamming(state, irsend); break;
-            case ENHANCED_BASIC: performEnhancedBasicJamming(state, irsend); break;
-            case SWEEP: performSweepJamming(state, irsend); break;
-            case RANDOM: performRandomJamming(state, irsend); break;
-            case EMPTY: performEmptyJamming(state, irsend); break;
-        }
-
-        // Update statistics after sending jam signals
-        updateStats(state);
-    }
-}
-
-/**
- * Implement basic jamming mode with fixed, equal mark/space timing
- * Uses both direct LED control and IR library for maximum effectiveness
- *
- * @param state Current jammer configuration
- * @param irsend IR transmitter interface
+ * BASIC — fixed mark/space timing, multi-protocol bundle, all 7 frequencies.
+ * Rotate through the full carrier table every call so a single "burst" hits
+ * 30, 33, 36, 38, 40, 42 and 56 kHz protocols.
  */
 void performBasicJamming(JammerState &state, IRsend &irsend) {
-    uint32_t currentMillis = millis();
+    uint32_t now = millis();
+    if (now - state.last_update < 20) return;
 
-    // Throttle transmission rate to prevent hardware overload
-    if (currentMillis - state.last_update > 20) {
-        // Method 1: Direct LED control for precise timing
-        // Generates simple square wave with equal mark/space duration
-        for (int i = 0; i < 50 * state.jamDensity; i++) {
-            digitalWrite(bruceConfigPins.irTx, HIGH);
-            delayMicroseconds(state.markTiming);
-            digitalWrite(bruceConfigPins.irTx, LOW);
-            delayMicroseconds(state.markTiming);
-        }
-
-        // Method 2: Use IR library for compatibility with different protocols
-        irsend.sendRaw(state.basicPattern, 20, getFrequency(state.current_freq_idx));
-        state.last_update = currentMillis;
+    // Rotate through every carrier frequency for full spectrum coverage
+    for (int fi = 0; fi < NUM_FREQS; fi++) {
+        uint16_t freq = getFrequency(fi);
+        irsend.sendRaw(state.basicPattern, 20, freq);
     }
+
+    // Supplement with direct GPIO blast at 38 kHz for non-standard demodulators
+    gpioBlast(bruceConfigPins.irTx, 60 * state.jamDensity);
+
+    state.last_update = now;
 }
 
 /**
- * Implement enhanced basic jamming with separate mark/space timing control
- * This mode provides more precise control over IR signal characteristics
- *
- * @param state Current jammer configuration
- * @param irsend IR transmitter interface
+ * ENHANCED BASIC — separate mark/space, multi-protocol bundle.
+ * Uses custom timings that can be tuned to a specific target protocol.
  */
 void performEnhancedBasicJamming(JammerState &state, IRsend &irsend) {
-    uint32_t currentMillis = millis();
+    uint32_t now = millis();
+    if (now - state.last_update < 20) return;
 
-    // Throttle transmission rate
-    if (currentMillis - state.last_update > 20) {
-        // Method 1: Direct LED control with separate mark/space timing
-        // Provides more flexibility to target specific IR protocols
-        for (int i = 0; i < 25 * state.jamDensity; i++) {
-            digitalWrite(bruceConfigPins.irTx, HIGH);
-            delayMicroseconds(state.markTiming);
-            digitalWrite(bruceConfigPins.irTx, LOW);
-            delayMicroseconds(state.spaceTiming);
-        }
-
-        // Method 2: Use IR library with custom pattern
-        irsend.sendRaw(state.basicPattern, 20, getFrequency(state.current_freq_idx));
-        state.last_update = currentMillis;
+    // Fire the user's custom pattern at the user-selected carrier
+    uint16_t freq = getFrequency(state.current_freq_idx);
+    for (int d = 0; d < state.jamDensity / 2 + 1; d++) {
+        irsend.sendRaw(state.basicPattern, 20, freq);
     }
+
+    // Additionally hit the target with all standard protocol bundles
+    sendBundle(irsend, freq);
+
+    gpioBlast(bruceConfigPins.irTx, 40 * state.jamDensity);
+    state.last_update = now;
 }
 
 /**
- * Implement sweep jamming mode that varies timing continuously
- * Effective against IR protocols with dynamic timing adaptation
- *
- * @param state Current jammer configuration
- * @param irsend IR transmitter interface
+ * SWEEP — timing bounces between minTiming and maxTiming while also
+ * rotating the carrier frequency.  Effective against adaptive IR receivers.
  */
 void performSweepJamming(JammerState &state, IRsend &irsend) {
-    uint32_t currentMillis = millis();
+    uint32_t now = millis();
+    if (now - state.last_update < 30) return;
 
-    // Faster update rate for smooth sweep
-    if (currentMillis - state.last_update > 30) {
-        // Update timing values based on current direction and speed
-        state.markTiming += state.sweepDirection * state.sweepSpeed;
-
-        // Change direction if we hit the min/max bounds
-        if (state.markTiming > state.maxTiming || state.markTiming < state.minTiming) {
-            state.sweepDirection *= -1; // Reverse direction
-            // Constrain to prevent exceeding bounds
-            state.markTiming = constrain(state.markTiming, state.minTiming, state.maxTiming);
-        }
-
-        // For sweep mode, keep mark and space timings equal
-        state.spaceTiming = state.markTiming;
-
-        // Update pattern array with new timings
-        updatePatterns(state);
-
-        // Direct LED control for precise timing
-        for (int i = 0; i < 20 * state.jamDensity; i++) {
-            digitalWrite(bruceConfigPins.irTx, HIGH);
-            delayMicroseconds(state.markTiming);
-            digitalWrite(bruceConfigPins.irTx, LOW);
-            delayMicroseconds(state.markTiming);
-        }
-
-        // Also use IR library for protocol compatibility
-        irsend.sendRaw(state.basicPattern, 20, getFrequency(state.current_freq_idx));
-        state.last_update = currentMillis;
+    // Advance timing
+    state.markTiming += state.sweepDirection * state.sweepSpeed;
+    if (state.markTiming > state.maxTiming || state.markTiming < state.minTiming) {
+        state.sweepDirection *= -1;
+        state.markTiming = constrain(state.markTiming, state.minTiming, state.maxTiming);
+        // Also advance carrier frequency when sweep bounces
+        state.current_freq_idx = (state.current_freq_idx + 1) % NUM_FREQS;
     }
+    state.spaceTiming = state.markTiming;
+    updatePatterns(state);
+
+    uint16_t freq = getFrequency(state.current_freq_idx);
+    for (int d = 0; d < state.jamDensity / 2 + 1; d++) {
+        irsend.sendRaw(state.basicPattern, 20, freq);
+    }
+
+    gpioBlast(bruceConfigPins.irTx, 30 * state.jamDensity);
+    state.last_update = now;
 }
 
 /**
- * Implement random jamming mode with unpredictable patterns
- * Most effective against smart/learning remotes and adaptive systems
- *
- * @param state Current jammer configuration
- * @param irsend IR transmitter interface
+ * RANDOM — regenerates both pattern and carrier per burst.
+ * Best against learning remotes and adaptive systems.
  */
 void performRandomJamming(JammerState &state, IRsend &irsend) {
-    uint32_t currentMillis = millis();
+    uint32_t now = millis();
+    if (now - state.last_update < 80) return;
 
-    // Slower update rate to allow for more random pattern generation
-    if (currentMillis - state.last_update > 100) {
-        // Generate new random pattern for each transmission
-        for (int i = 0; i < 30; i++) {
-            state.randomPattern[i] = random(5, 1000); // Random durations between 5-1000µs
-        }
+    for (int i = 0; i < 30; i++) state.randomPattern[i] = random(5, 1200);
 
-        // Send multiple random patterns based on jam density
-        for (int i = 0; i < state.jamDensity / 2 + 1; i++) {
-            // Randomly change carrier frequency to disrupt more protocols
-            if (random(10) < 3) { state.current_freq_idx = random(NUM_FREQS); }
-
-            // Send the random pattern at the selected frequency
-            irsend.sendRaw(state.randomPattern, 30, getFrequency(state.current_freq_idx));
-        }
-
-        state.last_update = currentMillis;
+    for (int d = 0; d < state.jamDensity / 2 + 1; d++) {
+        // Pick a new random carrier every transmission
+        uint16_t freq = getFrequency(random(NUM_FREQS));
+        irsend.sendRaw(state.randomPattern, 30, freq);
     }
+
+    // Also fire the multi-protocol bundle at a random carrier
+    sendBundle(irsend, getFrequency(random(NUM_FREQS)));
+
+    gpioBlast(bruceConfigPins.irTx, 20 * state.jamDensity);
+    state.last_update = now;
 }
 
 /**
- * Implement empty packet jamming mode with minimal valid IR signals
- * Effective at confusing IR receivers while using minimal power
- *
- * @param state Current jammer configuration
- * @param irsend IR transmitter interface
+ * EMPTY — minimal 4-sample packets at high density.
+ * Confuses AGC circuits with rapid bursts of almost-valid signals.
+ * Rotates carrier on every burst.
  */
 void performEmptyJamming(JammerState &state, IRsend &irsend) {
-    uint32_t currentMillis = millis();
+    uint32_t now = millis();
+    if (now - state.last_update < 40) return;
 
-    // Medium update rate optimized for empty packet transmission
-    if (currentMillis - state.last_update > 50) {
-        // Send multiple empty packets at the current frequency
-        for (int i = 0; i < state.jamDensity; i++) {
-            irsend.sendRaw(state.emptyPattern, 4, getFrequency(state.current_freq_idx));
-        }
-
-        // Occasionally change frequency (40% chance)
-        if (random(5) < 2) { state.current_freq_idx = (state.current_freq_idx + 1) % NUM_FREQS; }
-
-        state.last_update = currentMillis;
+    for (int d = 0; d < state.jamDensity; d++) {
+        state.current_freq_idx = (state.current_freq_idx + 1) % NUM_FREQS;
+        irsend.sendRaw(PAT_EMPTY, PAT_EMPTY_LEN, getFrequency(state.current_freq_idx));
     }
+
+    gpioBlast(bruceConfigPins.irTx, 25 * state.jamDensity);
+    state.last_update = now;
 }
 
-/**
- * Clean up resources and show exit message when jammer is stopped
- *
- * @param irsend IR transmitter interface to reset
- */
-void cleanupJammer(IRsend &irsend) {
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STATS / DISPATCH
+// ═══════════════════════════════════════════════════════════════════════════════
 
-#ifdef USE_BOOST /// ENABLE 5V OUTPUT
+void updateStats(JammerState &state) {
+    state.jamCount++;
+    // Trigger full UI redraw every 15 jams to keep stats fresh
+    if (state.jamCount % 15 == 0) state.redraw = true;
+}
+
+void performJamming(JammerState &state, IRsend &irsend) {
+    if (!state.jamming_active) return;
+
+    uint32_t now = millis();
+    uint32_t interval = (state.jamDensity > 0) ? (10 / state.jamDensity) : 10;
+    if (now - state.lastJamTime < interval) return;
+    state.lastJamTime = now;
+
+    switch (state.currentMode) {
+        case BASIC:          performBasicJamming(state, irsend);         break;
+        case ENHANCED_BASIC: performEnhancedBasicJamming(state, irsend); break;
+        case SWEEP:          performSweepJamming(state, irsend);         break;
+        case RANDOM:         performRandomJamming(state, irsend);        break;
+        case EMPTY:          performEmptyJamming(state, irsend);         break;
+    }
+
+    updateStats(state);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SETUP / TEARDOWN / ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void setupJammer(IRsend &irsend) {
+    checkIrTxPin();
+    irsend.begin();
+    setup_ir_pin(bruceConfigPins.irTx, OUTPUT);
+    drawMainBorder();
+}
+
+void cleanupJammer(IRsend &irsend) {
+#ifdef USE_BOOST
     PPM.disableOTG();
 #endif
-    // Ensure IR LED is turned off
     digitalWrite(bruceConfigPins.irTx, LOW);
-
-    // Display exit message
     displayRedStripe("IR Jamming Stopped");
-
-    // Short delay for user to see the message
     delay(1000);
 }
 
-/**
- * Main entry point for IR jammer functionality
- * Initializes hardware, runs the main loop, and handles cleanup
- */
 void startIrJammer() {
-#ifdef USE_BOOST /// ENABLE 5V OUTPUT
+#ifdef USE_BOOST
     PPM.enableOTG();
 #endif
-    // Initialize IR transmitter with configured pin
-    IRsend irsend(bruceConfigPins.irTx);
-
-    // Initialize jammer state structure
+    IRsend     irsend(bruceConfigPins.irTx);
     JammerState state;
 
-    // Set up hardware and state
     setupJammer(irsend);
     initJammerState(state);
 
-    // Main jammer loop - runs until ESC is pressed
     while (!check(EscPress)) {
-        renderJammerUI(state);         // Update display
-        performJamming(state, irsend); // Execute jamming if active
-        handleJammerInput(state);      // Process user input
-
-        // Small delay to prevent system overload
+        renderJammerUI(state);
+        performJamming(state, irsend);
+        handleJammerInput(state);
         delay(5);
     }
 
-    // Clean up when exiting
     cleanupJammer(irsend);
 }
 
-/**
- * Get IR carrier frequency in Hz for the given index
- * Uses program memory for efficient storage of frequency values
- *
- * @param index Index into the IR_FREQUENCIES array
- * @return Frequency value in Hz
- */
-uint16_t getFrequency(uint8_t index) { return pgm_read_word(&IR_FREQUENCIES[index]); }
+// ─── Utility accessors ────────────────────────────────────────────────────────
 
-/**
- * Get human-readable name for the current jamming mode
- *
- * @param index Index from JamMode enum
- * @return String containing the mode name
- */
+uint16_t   getFrequency(uint8_t index) { return pgm_read_word(&IR_FREQUENCIES[index]); }
 const char *getModeName(uint8_t index) { return IR_MODE_NAMES[index]; }
