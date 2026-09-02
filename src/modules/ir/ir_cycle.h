@@ -14,8 +14,6 @@
 #pragma once
 
 #include <Arduino.h>
-#include <IRremoteESP8266.h>
-#include <IRsend.h>
 
 /**
  * Main entry point.
