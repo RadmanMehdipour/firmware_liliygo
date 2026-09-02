@@ -211,7 +211,7 @@ static void sendCycleCommand(IRsend &irsend, decode_type_t proto,
             irsend.sendNEC(data, 32);
             break;
         case SONY:
-            data = irsend.encodeSony(command, address, 12);
+            data = irsend.encodeSony(12, command, address);
             irsend.sendSony(data, 12, 2);
             break;
         case RC5:
@@ -231,7 +231,14 @@ static void sendCycleCommand(IRsend &irsend, decode_type_t proto,
             irsend.sendLG(data, 28);
             break;
         case PANASONIC:
-            data = irsend.encodePanasonic(address, command);
+            // encodePanasonic(manufacturer, device, subdevice, function)
+            // Pack address high/low byte into device/subdevice, command into function
+            data = irsend.encodePanasonic(
+                address,
+                (uint8_t)(address & 0xFF),
+                (uint8_t)(command >> 8),
+                (uint8_t)(command & 0xFF)
+            );
             irsend.sendPanasonic64(data, 48);
             break;
         case JVC:
