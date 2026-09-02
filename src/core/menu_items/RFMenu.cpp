@@ -12,26 +12,86 @@
 #include "modules/rf/rf_spectrum.h"
 #include "modules/rf/rf_waterfall.h"
 
+
+
 void RFMenu::optionsMenu() {
-    options = {
-        {"Scan/copy",       [=]() { RFScan(); }       },
+    options.clear();
+
+    /*
+     * RF main menu
+     *
+     *   - Record Signal
+     *   - Transmit
+     *   - Attacks
+     *   - Sniffers
+     *   - Config
+     */
+
+    // =========================================================
+    // RECORD SIGNAL (top level)
+    // =========================================================
+    options.push_back({"Record Signal", [=]() { RFScan(); }});
+
+    // =========================================================
+    // TRANSMIT (top level)
+    // =========================================================
 #if !defined(LITE_VERSION)
-        {"Record RAW",      rf_raw_record             }, // Pablo-Ortiz-Lopez
-        {"Custom SubGhz",   sendCustomRF              },
+    options.push_back({"Transmit", sendCustomRF});
 #endif
-        {"Spectrum",        rf_spectrum               },
+
+    // =========================================================
+    // ATTACKS
+    // =========================================================
+    options.push_back({"Attacks", [this]() {
+                           std::vector<Option> attackOptions;
+
 #if !defined(LITE_VERSION)
-        {"RSSI Spectrum",   rf_CC1101_rssi            }, // @Pirata
-        {"SquareWave Spec", rf_SquareWave             }, // @Pirata
-        {"Spectogram",      rf_waterfall              }, // dev_eclipse
+                           attackOptions.push_back({"Bruteforce", rf_bruteforce}); // dev_eclipse
+
+                           attackOptions.push_back({"Jammer", [=]() { RFJammer(true); }});
+#endif
+
+                           attackOptions.push_back({"Back", [this]() { optionsMenu(); }});
+
+                           loopOptions(attackOptions, MENU_TYPE_SUBMENU, "Attacks");
+                       }});
+
+
+    // =========================================================
+    // SNIFFERS
+    // =========================================================
+    options.push_back({"Sniffers", [this]() {
+                           std::vector<Option> snifferOptions;
+
+#if !defined(LITE_VERSION)
+                           snifferOptions.push_back({"Record RAW", rf_raw_record}); // Pablo-Ortiz-Lopez
+
+                           snifferOptions.push_back({"Spectrum", rf_spectrum});
+
+                           snifferOptions.push_back({"RSSI Spectrum", rf_CC1101_rssi}); // @Pirata
+
+                           snifferOptions.push_back({"SquareWave Spec", rf_SquareWave}); // @Pirata
+
+                           snifferOptions.push_back({"Spectogram", rf_waterfall}); // dev_eclipse
+
 #if defined(BUZZ_PIN) or defined(HAS_NS4168_SPKR) and defined(RF_LISTEN_H)
-        {"Listen",          rf_listen                 }, // dev_eclipse
+                           snifferOptions.push_back({"Listen", rf_listen}); // dev_eclipse
 #endif
-        {"Bruteforce",      rf_bruteforce             }, // dev_eclipse
-        {"Jammer",          [=]() { RFJammer(true); } },
+#else
+                           snifferOptions.push_back({"Spectrum", rf_spectrum});
 #endif
-        {"Config",          [this]() { configMenu(); }},
-    };
+
+                           snifferOptions.push_back({"Back", [this]() { optionsMenu(); }});
+
+                           loopOptions(snifferOptions, MENU_TYPE_SUBMENU, "Sniffers");
+                       }});
+
+
+    // =========================================================
+    // CONFIG (at the very bottom)
+    // =========================================================
+    options.push_back({"Config", [this]() { configMenu(); }});
+
     addOptionToMainMenu();
 
     delay(200);
@@ -40,7 +100,11 @@ void RFMenu::optionsMenu() {
     else txt += " Tx: " + String(bruceConfigPins.rfTx) + " Rx: " + String(bruceConfigPins.rfRx);
 
     loopOptions(options, MENU_TYPE_SUBMENU, txt.c_str());
+
+    options.clear();
 }
+
+
 
 void RFMenu::configMenu() {
     options = {
