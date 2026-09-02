@@ -9,24 +9,10 @@
  *  Dial / encoder   → Up = faster (less delay), Down = slower (more delay)
  *  OK / Sel         → Pause / Resume
  *  ESC / Back       → Stop and exit
- *
- * Layout (128 × 64 display)
- * ─────────────────────────
- *  ┌──────────────────────────────┐
- *  │       IR CYCLE               │  ← title bar (inverse)
- *  ├──────────────────────────────┤
- *  │  Proto: NEC   Addr: 0x1234   │
- *  │  CMD ▶  0x00AB               │  ← big current command
- *  │  1234 / 65536   1%           │  ← progress
- *  │  ████████░░░░░░░░░░░░░░░░░░  │  ← progress bar
- *  │  Spd: ████░░  42ms  1m 23s   │  ← speed bar + elapsed
- *  ├──────────────────────────────┤
- *  │  [OK]=Pause [ENC]=Speed [ESC]│
- *  └──────────────────────────────┘
  */
 
 #include "ir_cycle.h"
-#include "TV-B-Gone.h"       // checkIrTxPin()
+#include "TV-B-Gone.h"          // checkIrTxPin()
 #include "core/display.h"
 #include "core/mykeyboard.h"
 #include "core/settings.h"
@@ -34,57 +20,36 @@
 #include "ir_read.h"
 #include "ir_utils.h"
 #include <globals.h>
-#include <interface.h>
+// IRremoteESP8266 — same library Bruce uses everywhere else
+#include <IRrecv.h>
+#include <IRsend.h>
+#include <IRutils.h>
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-static const uint32_t TOTAL_COMMANDS    = 65536;  // 0x0000 – 0xFFFF
-static const uint32_t SPEED_STEP_MS     = 5;      // how much dial changes delay
-static const uint32_t SPEED_MIN_MS      = 5;      // fastest: 5 ms between commands
-static const uint32_t SPEED_MAX_MS      = 500;    // slowest: 500 ms between commands
-static const uint32_t SPEED_DEFAULT_MS  = 35;     // comfortable default
-
-// How many pixels wide the progress bar and speed bar are
-static const int BAR_W = 116;
+static const uint32_t TOTAL_COMMANDS   = 65536;  // 0x0000 – 0xFFFF
+static const uint32_t SPEED_STEP_MS    = 5;
+static const uint32_t SPEED_MIN_MS     = 5;
+static const uint32_t SPEED_MAX_MS     = 500;
+static const uint32_t SPEED_DEFAULT_MS = 35;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/**
- * Draw title bar (filled rectangle with white inverse text).
- */
-static void drawTitleBar(const char *text, bool paused) {
-    // Title background
-    u8g2.setDrawColor(1);
-    u8g2.drawBox(0, 0, 128, 11);
-    u8g2.setDrawColor(0);
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(4, 9, text);
-
-    // Pause badge on the right
-    if (paused) {
-        u8g2.setFont(u8g2_font_5x7_tf);
-        u8g2.drawStr(86, 9, "PAUSED");
-    }
-    u8g2.setDrawColor(1);
-}
-
-/**
- * Draw a filled progress bar at (x, y) of width w, height h, fill fraction 0.0–1.0.
- */
-static void drawBar(int x, int y, int w, int h, float frac) {
-    u8g2.drawRFrame(x, y, w, h, 1);
-    int fill = (int)((w - 2) * frac);
-    if (fill > 0) u8g2.drawBox(x + 1, y + 1, fill, h - 2);
-}
-
-/**
- * Format elapsed time as "Xs", "Xm Ys" or "Xh Ym".
- */
 static String fmtTime(uint32_t ms) {
     uint32_t s = ms / 1000;
-    if (s < 60)  return String(s) + "s";
+    if (s < 60)   return String(s) + "s";
     if (s < 3600) return String(s / 60) + "m " + String(s % 60) + "s";
     return String(s / 3600) + "h " + String((s % 3600) / 60) + "m";
+}
+
+/**
+ * Draw a horizontal progress bar using TFT primitives.
+ * Outline rect + filled inner rect proportional to frac (0.0–1.0).
+ */
+static void drawBar(int x, int y, int w, int h, float frac) {
+    tft.drawRect(x, y, w, h, bruceConfig.priColor);
+    int fill = (int)((w - 2) * frac);
+    if (fill > 0) tft.fillRect(x + 1, y + 1, fill, h - 2, bruceConfig.priColor);
 }
 
 // ─── Screen draw ─────────────────────────────────────────────────────────────
@@ -95,147 +60,137 @@ static void drawCycleScreen(
     uint32_t delayMs, unsigned long startMs,
     bool paused
 ) {
-    u8g2.clearBuffer();
+    // Use Bruce's standard border + title
+    String title = paused ? "IR CYCLE [PAUSED]" : "IR CYCLE";
+    drawMainBorderWithTitle(title);
 
-    // ---- Title bar ----
-    drawTitleBar("IR CYCLE", paused);
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setTextSize(FP);
+    tft.setCursor(BORDER_PAD_X, BORDER_PAD_Y);
 
-    // ---- Protocol + Address row ----
-    u8g2.setFont(u8g2_font_5x7_tf);
-    u8g2.setDrawColor(1);
+    // Proto + address line
+    char protoStr[32];
+    snprintf(protoStr, sizeof(protoStr), "Proto:%-4d Addr:0x%04X", (int)proto, address);
+    padprintln(protoStr);
 
-    char protoStr[20];
-    // typeToString is from IRutils; fallback to raw int if not available
-    snprintf(protoStr, sizeof(protoStr), "Proto:%-4d  Addr:0x%04X", (int)proto, address);
-    u8g2.drawStr(2, 20, protoStr);
+    // Current command — bigger text
+    tft.setTextSize(FM);
+    char cmdHex[16];
+    snprintf(cmdHex, sizeof(cmdHex), "CMD: 0x%04X", (unsigned int)currentCmd);
+    padprintln(cmdHex);
 
-    // ---- Big current command ----
-    u8g2.setFont(u8g2_font_8x13B_tf);
-    char cmdHex[12];
-    snprintf(cmdHex, sizeof(cmdHex), "0x%04X", (unsigned int)currentCmd);
-    // Draw label in small font, then value large
-    u8g2.setFont(u8g2_font_5x7_tf);
-    u8g2.drawStr(2, 30, "CMD");
-    u8g2.setFont(u8g2_font_8x13B_tf);
-    u8g2.drawStr(22, 31, cmdHex);
+    // Progress numbers
+    tft.setTextSize(FP);
+    char progStr[32];
+    int pct = (totalCmds > 0) ? (int)(((float)currentCmd / (float)totalCmds) * 100.0f) : 0;
+    snprintf(progStr, sizeof(progStr), "%lu/%lu  %d%%", currentCmd, totalCmds, pct);
+    padprintln(progStr);
 
-    // ---- Progress numbers ----
-    u8g2.setFont(u8g2_font_5x7_tf);
-    char progStr[24];
-    int pct = (int)(((float)currentCmd / (float)totalCmds) * 100.0f);
-    snprintf(progStr, sizeof(progStr), "%lu/%lu   %d%%", currentCmd, totalCmds, pct);
-    u8g2.drawStr(2, 40, progStr);
+    // Progress bar
+    int barY = tft.getCursorY();
+    drawBar(BORDER_PAD_X, barY, tftWidth - BORDER_PAD_X * 2, 6,
+            (float)currentCmd / (float)totalCmds);
+    tft.setCursor(BORDER_PAD_X, barY + 8);
 
-    // ---- Progress bar ----
-    float progFrac = (float)currentCmd / (float)totalCmds;
-    drawBar(6, 42, BAR_W, 5, progFrac);
-
-    // ---- Speed bar + elapsed time ----
-    // speed fraction: full bar = fastest (min delay), empty = slowest (max delay)
+    // Speed bar
     float speedFrac = 1.0f - (float)(delayMs - SPEED_MIN_MS) / (float)(SPEED_MAX_MS - SPEED_MIN_MS);
     if (speedFrac < 0.0f) speedFrac = 0.0f;
     if (speedFrac > 1.0f) speedFrac = 1.0f;
 
-    u8g2.setFont(u8g2_font_4x6_tf);
-    u8g2.drawStr(2, 50, "Spd");
-    drawBar(18, 45, 60, 5, speedFrac);
+    padprint("Spd:");
+    int spdBarX = tft.getCursorX();
+    int spdBarY = tft.getCursorY();
+    drawBar(spdBarX, spdBarY, 60, 6, speedFrac);
 
     char spdStr[12];
-    snprintf(spdStr, sizeof(spdStr), "%lums", delayMs);
-    u8g2.drawStr(80, 50, spdStr);
+    snprintf(spdStr, sizeof(spdStr), " %lums", delayMs);
+    tft.setCursor(spdBarX + 62, spdBarY);
+    padprintln(spdStr);
 
     // Elapsed time
-    String elapsed = fmtTime(millis() - startMs);
-    u8g2.drawStr(2, 56, elapsed.c_str());
-
-    // ---- Footer ----
-    u8g2.drawHLine(0, 57, 128);
-    u8g2.setFont(u8g2_font_4x6_tf);
-    u8g2.drawStr(0, 63, "[OK]Pause [ENC]Spd [ESC]Stop");
-
-    u8g2.sendBuffer();
+    String elapsed = "Time: " + fmtTime(millis() - startMs);
+    padprintln(elapsed);
 }
 
-// ─── Capture screen ──────────────────────────────────────────────────────────
+// ─── Capture screens ─────────────────────────────────────────────────────────
 
 static void drawWaitScreen() {
-    u8g2.clearBuffer();
-    drawTitleBar("IR CYCLE", false);
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(4, 26, "Point remote at");
-    u8g2.drawStr(4, 37, "IR sensor and");
-    u8g2.drawStr(4, 48, "press a button.");
-    u8g2.setFont(u8g2_font_4x6_tf);
-    u8g2.drawStr(2, 62, "[ESC] Cancel");
-    u8g2.sendBuffer();
+    drawMainBorderWithTitle("IR CYCLE");
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setTextSize(FP);
+    tft.setCursor(BORDER_PAD_X, BORDER_PAD_Y);
+    padprintln("Point remote at");
+    padprintln("IR sensor and");
+    padprintln("press a button.");
+    tft.println("");
+    padprintln("[ESC] Cancel");
 }
 
 static void drawCapturedScreen(decode_type_t proto, uint16_t address, uint16_t command) {
-    u8g2.clearBuffer();
-    drawTitleBar("CAPTURED!", false);
-    u8g2.setFont(u8g2_font_5x7_tf);
-    char line[24];
-    snprintf(line, sizeof(line), "Proto: %d", (int)proto);
-    u8g2.drawStr(4, 22, line);
+    drawMainBorderWithTitle("CAPTURED!");
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setTextSize(FP);
+    tft.setCursor(BORDER_PAD_X, BORDER_PAD_Y);
+
+    char line[32];
+    snprintf(line, sizeof(line), "Proto: %s", typeToString(proto).c_str());
+    padprintln(line);
     snprintf(line, sizeof(line), "Addr : 0x%04X", address);
-    u8g2.drawStr(4, 31, line);
+    padprintln(line);
     snprintf(line, sizeof(line), "Cmd  : 0x%04X", command);
-    u8g2.drawStr(4, 40, line);
-    u8g2.drawHLine(0, 49, 128);
-    u8g2.setFont(u8g2_font_4x6_tf);
-    u8g2.drawStr(2, 56, "[OK/RIGHT] Start cycle");
-    u8g2.drawStr(2, 63, "[LEFT]  Retry  [ESC] Back");
-    u8g2.sendBuffer();
+    padprintln(line);
+    tft.println("");
+    padprintln("[OK/RIGHT] Start cycle");
+    padprintln("[LEFT]  Retry");
+    padprintln("[ESC]   Back");
 }
 
 static void drawCompletedScreen(uint32_t totalCmds, unsigned long elapsedMs) {
-    u8g2.clearBuffer();
-    drawTitleBar("COMPLETE!", false);
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(10, 25, "All commands sent!");
-    char line[24];
+    drawMainBorderWithTitle("COMPLETE!");
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setTextSize(FM);
+    tft.setCursor(BORDER_PAD_X, BORDER_PAD_Y);
+    padprintln("All commands sent!");
+    tft.setTextSize(FP);
+    char line[32];
     snprintf(line, sizeof(line), "%lu commands", totalCmds);
-    u8g2.drawStr(10, 37, line);
+    padprintln(line);
     String elapsed = "Time: " + fmtTime(elapsedMs);
-    u8g2.drawStr(10, 49, elapsed.c_str());
-    u8g2.setFont(u8g2_font_4x6_tf);
-    u8g2.drawStr(2, 63, "Any button to exit");
-    u8g2.sendBuffer();
+    padprintln(elapsed);
+    tft.println("");
+    padprintln("Any button to exit");
 }
 
 // ─── Capture phase ───────────────────────────────────────────────────────────
 
 /**
- * Wait for an IR signal and decode it.
- * Returns true if a valid signal was captured, false if the user cancelled.
+ * Wait for an IR signal using IRremoteESP8266's IRrecv.
+ * Returns true if captured, false if user cancelled.
  */
-static bool captureSignal(decode_type_t &proto, uint16_t &address, uint16_t &command,
-                           uint16_t *rawBuf, uint8_t &rawLen) {
-    IrReceiver.begin(bruceConfigPins.irRx, ENABLE_LED_FEEDBACK);
+static bool captureSignal(decode_type_t &proto, uint16_t &address, uint16_t &command) {
+    IRrecv irrecv(bruceConfigPins.irRx, SAFE_STACK_BUFFER_SIZE / 2, 50);
+    decode_results results;
+    irrecv.enableIRIn();
+    setup_ir_pin(bruceConfigPins.irRx, INPUT);
 
     while (true) {
         drawWaitScreen();
 
         if (check(EscPress)) {
-            IrReceiver.end();
+            irrecv.disableIRIn();
             return false;
         }
 
-        if (IrReceiver.decode()) {
-            if (IrReceiver.decodedIRData.decodedRawData != 0 &&
-                IrReceiver.decodedIRData.protocol != UNKNOWN) {
-                proto   = IrReceiver.decodedIRData.protocol;
-                address = (uint16_t)IrReceiver.decodedIRData.address;
-                command = (uint16_t)IrReceiver.decodedIRData.command;
-                rawLen  = IrReceiver.decodedIRData.rawDataPtr->rawlen;
-                for (int i = 0; i < rawLen && i < RAW_BUFFER_LENGTH; i++)
-                    rawBuf[i] = IrReceiver.decodedIRData.rawDataPtr->rawbuf[i];
-
-                IrReceiver.resume();
-                IrReceiver.end();
+        if (irrecv.decode(&results)) {
+            if (results.decode_type != UNKNOWN && results.value != 0) {
+                proto   = results.decode_type;
+                address = (uint16_t)(results.address & 0xFFFF);
+                command = (uint16_t)(results.command & 0xFFFF);
+                irrecv.resume();
+                irrecv.disableIRIn();
                 return true;
             }
-            IrReceiver.resume();
+            irrecv.resume();
         }
         delay(10);
     }
@@ -243,25 +198,54 @@ static bool captureSignal(decode_type_t &proto, uint16_t &address, uint16_t &com
 
 // ─── Send a single command ────────────────────────────────────────────────────
 
+/**
+ * IRremoteESP8266 API: encode first, then send(encodedData, bits).
+ * Protocol constants and encode/send methods match the library Bruce uses.
+ */
 static void sendCycleCommand(IRsend &irsend, decode_type_t proto,
                               uint16_t address, uint16_t command) {
+    uint64_t data = 0;
     switch (proto) {
-        case NEC:       irsend.sendNEC(address, command, 0);       break;
-        case SONY:      irsend.sendSony(address, command, 2);      break;
-        case RC5:       irsend.sendRC5(address, command, 0);       break;
-        case RC6:       irsend.sendRC6(address, command, 0);       break;
-        case SAMSUNG:   irsend.sendSamsung(address, command, 0);   break;
-        case SAMSUNG36: irsend.sendSamsung36(address, command, 0); break;
-        case LG:        irsend.sendLG(address, command, 0);        break;
-        case PANASONIC: irsend.sendPanasonic(address, command, 0); break;
-        case PIONEER:   irsend.sendPioneer(address, command, 0);   break;
-        case JVC:       irsend.sendJVC(address, command, 0);       break;
-        case SHARP:     irsend.sendSharpRaw(
-                            ((uint32_t)address << 5) | (command & 0x1F), 15);
-                        break;
+        case NEC:
+            data = irsend.encodeNEC(address, command);
+            irsend.sendNEC(data, 32);
+            break;
+        case SONY:
+            data = irsend.encodeSony(command, address, 12);
+            irsend.sendSony(data, 12, 2);
+            break;
+        case RC5:
+            data = irsend.encodeRC5(address, command);
+            irsend.sendRC5(data, 13);
+            break;
+        case RC6:
+            data = irsend.encodeRC6(address, command, 4);
+            irsend.sendRC6(data, 20);
+            break;
+        case SAMSUNG:
+            data = irsend.encodeSAMSUNG(address, command);
+            irsend.sendSAMSUNG(data, 32);
+            break;
+        case LG:
+            data = irsend.encodeLG(address, command);
+            irsend.sendLG(data, 28);
+            break;
+        case PANASONIC:
+            data = irsend.encodePanasonic(address, command);
+            irsend.sendPanasonic64(data, 48);
+            break;
+        case JVC:
+            data = irsend.encodeJVC(address, command);
+            irsend.sendJVC(data, 16);
+            break;
+        case SHARP:
+            data = irsend.encodeSharp(address, command);
+            irsend.sendSharp(address, command);
+            break;
         default:
             // Fallback: send as NEC
-            irsend.sendNEC(address, command, 0);
+            data = irsend.encodeNEC(address, command);
+            irsend.sendNEC(data, 32);
             break;
     }
 }
@@ -276,16 +260,13 @@ void startIrCycle() {
     setup_ir_pin(bruceConfigPins.irTx, OUTPUT);
 
     // ---- Phase 1: Capture a base signal ----
-    decode_type_t proto = UNKNOWN;
+    decode_type_t proto       = UNKNOWN;
     uint16_t      baseAddress = 0;
     uint16_t      baseCommand = 0;
-    uint16_t      rawBuf[RAW_BUFFER_LENGTH];
-    uint8_t       rawLen = 0;
 
 captureAgain:
-    if (!captureSignal(proto, baseAddress, baseCommand, rawBuf, rawLen)) {
-        // User pressed ESC — bail out cleanly
-        return;
+    if (!captureSignal(proto, baseAddress, baseCommand)) {
+        return;  // user pressed ESC
     }
 
     // ---- Phase 2: Confirm ----
@@ -294,46 +275,36 @@ captureAgain:
     delay(200);
 
     while (true) {
-        if (check(EscPress))  return;         // cancel entirely
-        if (check(PrevPress)) goto captureAgain; // retry capture
-        if (check(SelPress) || check(NextPress)) break; // start cycling
+        if (check(EscPress))  return;
+        if (check(PrevPress)) goto captureAgain;
+        if (check(SelPress) || check(NextPress)) break;
         delay(25);
     }
 
     // ---- Phase 3: Cycle ----
-    uint32_t    currentCmd  = 0;
-    uint32_t    delayMs     = SPEED_DEFAULT_MS;
-    bool        paused      = false;
-    unsigned long startMs   = millis();
-    unsigned long lastDraw  = 0;
-    bool        done        = false;
+    uint32_t      currentCmd = 0;
+    uint32_t      delayMs    = SPEED_DEFAULT_MS;
+    bool          paused     = false;
+    unsigned long startMs    = millis();
+    unsigned long lastDraw   = 0;
+    bool          done       = false;
 
     SelPress = false; EscPress = false; NextPress = false; PrevPress = false;
     delay(100);
 
     while (!done) {
-        // ── Input ──────────────────────────────────────────────────────────
-        if (check(EscPress)) break;  // stop and exit
+        if (check(EscPress)) break;
 
         if (check(SelPress)) {
-            paused = !paused;
-            // Force immediate redraw to show PAUSED badge
+            paused   = !paused;
             lastDraw = 0;
         }
 
-        // Dial / encoder: Next = faster, Prev = slower
-        if (check(NextPress)) {
-            if (delayMs > SPEED_MIN_MS) {
-                delayMs = max((uint32_t)SPEED_MIN_MS, delayMs - SPEED_STEP_MS);
-            }
-        }
-        if (check(PrevPress)) {
-            if (delayMs < SPEED_MAX_MS) {
-                delayMs = min((uint32_t)SPEED_MAX_MS, delayMs + SPEED_STEP_MS);
-            }
-        }
+        if (check(NextPress))
+            delayMs = max((uint32_t)SPEED_MIN_MS, delayMs - SPEED_STEP_MS);
+        if (check(PrevPress))
+            delayMs = min((uint32_t)SPEED_MAX_MS, delayMs + SPEED_STEP_MS);
 
-        // ── Redraw every 100 ms ─────────────────────────────────────────────
         unsigned long now = millis();
         if (now - lastDraw >= 100) {
             drawCycleScreen(proto, baseAddress, currentCmd,
@@ -341,7 +312,6 @@ captureAgain:
             lastDraw = now;
         }
 
-        // ── Send ────────────────────────────────────────────────────────────
         if (!paused) {
             sendCycleCommand(irsend, proto, baseAddress, (uint16_t)currentCmd);
             currentCmd++;
@@ -351,7 +321,6 @@ captureAgain:
                 break;
             }
 
-            // Honour the speed delay while still polling buttons
             unsigned long sendDone = millis();
             while (millis() - sendDone < delayMs) {
                 if (check(SelPress) || check(EscPress) ||
@@ -359,7 +328,7 @@ captureAgain:
                 delay(5);
             }
         } else {
-            delay(25); // idle when paused
+            delay(25);
         }
     }
 
@@ -369,5 +338,4 @@ captureAgain:
         delay(200);
         while (!check(AnyKeyPress)) delay(25);
     }
-    // If ESC was pressed we just fall through and return
 }
