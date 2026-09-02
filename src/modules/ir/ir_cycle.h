@@ -15,8 +15,4 @@
 
 #include <Arduino.h>
 
-/**
- * Main entry point.
- * Call from the IR options menu — blocks until the user exits.
- */
 void startIrCycle();
