@@ -8,13 +8,55 @@
 
 void NRF24Menu::optionsMenu() {
     options.clear();
-    options.push_back({"Information", nrf_info});
-    options.push_back({"Spectrum", nrf_spectrum});
-    #if !defined(LITE_VERSION)
-    options.push_back({"MouseJack", nrf_mousejack});
-    #endif
-    options.push_back({"NRF Jammer", nrf_jammer});
 
+    /*
+     * NRF24 main menu
+     *
+     *   - Information
+     *   - Attacks
+     *   - Sniffers
+     *   - Config (M5Stick C+ / C+2 only)
+     */
+
+    // =========================================================
+    // INFORMATION (top level)
+    // =========================================================
+    options.push_back({"Information", nrf_info});
+
+    // =========================================================
+    // ATTACKS
+    // =========================================================
+    options.push_back({"Attacks", [this]() {
+                           std::vector<Option> attackOptions;
+
+#if !defined(LITE_VERSION)
+                           attackOptions.push_back({"MouseJack", nrf_mousejack});
+#endif
+                           attackOptions.push_back({"NRF Jammer", nrf_jammer});
+
+                           attackOptions.push_back({"Back", [this]() { optionsMenu(); }});
+
+                           loopOptions(attackOptions, MENU_TYPE_SUBMENU, "Attacks");
+                       }});
+
+
+    // =========================================================
+    // SNIFFERS
+    // =========================================================
+    options.push_back({"Sniffers", [this]() {
+                           std::vector<Option> snifferOptions;
+
+                           snifferOptions.push_back({"Spectrum", nrf_spectrum});
+
+                           snifferOptions.push_back({"Back", [this]() { optionsMenu(); }});
+
+                           loopOptions(snifferOptions, MENU_TYPE_SUBMENU, "Sniffers");
+                       }});
+
+
+    // =========================================================
+    // CONFIG (M5Stick C+ / C+2 only, at the bottom)
+    // =========================================================
 #if defined(ARDUINO_M5STICK_C_PLUS) || defined(ARDUINO_M5STICK_C_PLUS2)
     options.push_back({"Config pins", [this]() { configMenu(); }});
 #endif
@@ -22,6 +64,8 @@ void NRF24Menu::optionsMenu() {
     addOptionToMainMenu();
 
     loopOptions(options, MENU_TYPE_SUBMENU, "NRF24");
+
+    options.clear();
 }
 
 void NRF24Menu::configMenu() {
