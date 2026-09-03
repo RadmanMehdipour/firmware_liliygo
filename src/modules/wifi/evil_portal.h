@@ -11,7 +11,9 @@ class EvilPortal {
     public:
         CaptiveRequestHandler(EvilPortal *portal) : _portal(portal) {}
         virtual ~CaptiveRequestHandler() { _portal = nullptr; }
-        bool canHandle(AsyncWebServerRequest *request) { return true; }
+        bool canHandle(AsyncWebServerRequest *request) override {
+    return true; // handle EVERYTHING — this is what makes Windows/Apple work
+}
         void handleRequest(AsyncWebServerRequest *request);
 
     private:
