@@ -120,22 +120,23 @@ void EvilPortal::CaptiveRequestHandler::handleRequest(AsyncWebServerRequest *req
     }
 
 
-    // Android / Samsung / Chrome / ChromeOS
+// Android / Samsung / Chrome / ChromeOS
 if (url == "/generate_204" || url == "/gen_204" || url == "/generate204" ||
-    url.find("generate_204") != std::string::npos ||
-    url.find("connectivitycheck") != std::string::npos ||
-    url.find("clients3.google") != std::string::npos ||
-    url.find("clients4.google") != std::string::npos) {
+    url.indexOf("generate_204") != -1 ||
+    url.indexOf("connectivitycheck") != -1 ||
+    url.indexOf("clients3.google") != -1 ||
+    url.indexOf("clients4.google") != -1) {
     request->send(200, "text/plain", "not the internet"); // wrong body = portal detected
-        return;
-} 
+    return;
+}
+
 // Apple
-if (url == "/hotspot-detect.html" || 
-         url == "/library/test/success.html" || 
-         url == "/success.html" || 
-         url.find("hotspot-detect") != std::string::npos) {
-  request->send(200, "text/plain", "not the internet"); // wrong body = portal detected
-        return;
+if (url == "/hotspot-detect.html" ||
+    url == "/library/test/success.html" ||
+    url == "/success.html" ||
+    url.indexOf("hotspot-detect") != -1) {
+    request->send(200, "text/plain", "not the internet"); // wrong body = portal detected
+    return;
 }
 
 
