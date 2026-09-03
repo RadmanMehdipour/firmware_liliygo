@@ -369,7 +369,7 @@ static const uint8_t vendorOUIs[][3] PROGMEM = {
 };
 static const int NUM_OUIS = sizeof(vendorOUIs)/3;
 
-static void generateRandomBSSID(uint8_t *b) {
+void generateRandomBSSID(uint8_t *b) {
     uint8_t idx = esp_random() % NUM_OUIS;
     memcpy_P(b, vendorOUIs[idx], 3);
     b[3] = esp_random()&0xFF; b[4] = esp_random()&0xFF; b[5] = esp_random()&0xFF;
@@ -841,7 +841,7 @@ static void launchPortal(const String &ssid, uint8_t channel) {
 // ============================================================================
 // Portal template loading
 // ============================================================================
-static String getDisplayName(const String &path, bool isSD) {
+String getDisplayName(const String &path, bool isSD) {
     String name = path.substring(path.lastIndexOf('/')+1);
     name.replace(".html","");
     return (isSD?"[SD] ":"[FS] ") + name;
